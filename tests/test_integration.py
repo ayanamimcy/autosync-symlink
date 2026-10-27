@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 from urllib.error import URLError
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
 from bridge.config import DEFAULT, atomic_json
 from bridge.engine import Engine
@@ -38,11 +38,18 @@ class LocalIntegration(unittest.TestCase):
             (source/"movie.nfo").write_bytes(b"old")
             command = [sys.executable, "run.py", "--data-dir", str(data), "serve"]
             base = f"http://127.0.0.1:{port}"
+            service_log = tempfile.TemporaryFile()
+            self.addCleanup(service_log.close)
             def start():
                 return subprocess.Popen(command, cwd=Path(__file__).resolve().parents[1],
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        stdout=service_log, stderr=subprocess.STDOUT)
             process = start()
-            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            # These requests must stay on loopback even when a runner configures
+            # environment or macOS system proxies.
+            opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            def diagnostics():
+                service_log.seek(0)
+                return service_log.read().decode(errors="replace")[-8000:]
             def request(path, body=None):
                 encoded = json.dumps(body).encode() if body is not None else None
                 req = Request(base+path, encoded, {"X-Media-Bridge": "1", "Content-Type": "application/json"})
@@ -50,15 +57,17 @@ class LocalIntegration(unittest.TestCase):
                     return json.load(response)
             def wait_for(check, timeout=12):
                 until = time.monotonic()+timeout
+                last_error = None
                 while time.monotonic() < until:
-                    self.assertIsNone(process.poll(), "service process exited")
+                    if process.poll() is not None:
+                        self.fail("service process exited:\n"+diagnostics())
                     try:
                         if check():
                             return
-                    except (URLError, FileNotFoundError, ConnectionError):
-                        pass
+                    except (URLError, FileNotFoundError, ConnectionError) as error:
+                        last_error = error
                     time.sleep(.15)
-                self.fail("local integration condition timed out")
+                self.fail(f"local integration condition timed out; last error: {last_error!r}\n{diagnostics()}")
             try:
                 wait_for(lambda: request("/healthz")["ok"])
                 request("/api/login", {"key": (data/"admin.key").read_text()})
