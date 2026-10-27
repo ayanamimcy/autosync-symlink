@@ -1,4 +1,5 @@
 from pathlib import Path, PurePosixPath
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
 import stat
 import time
@@ -40,55 +41,77 @@ def retry_io(operation):
             time.sleep((0.25,0.75,1.5)[attempt])
 
 
-def walk(root: Path, errors=None, progress=None, exclude_dirs=()):
-    """Optionally collect failures; callers must suppress cleanup if any occur."""
+def _read_directory(folder, excluded):
+    files, children, failures = [], [], []
+    def enumerate_folder():
+        try:
+            with os.scandir(folder) as it:
+                return list(it)
+        except OSError as e:
+            if getattr(e,"winerror",None)==2 and folder.is_dir():
+                # Cloud virtual filesystems can report FILE_NOT_FOUND on an
+                # empty directory. Confirm it through an independent listing.
+                if not os.listdir(folder):
+                    return []
+            raise
+    try:
+        entries = retry_io(enumerate_folder)
+    except OSError as e:
+        return files, children, [(f"无法枚举 {folder}: {e}", e)]
+    for entry in entries:
+        p = Path(entry.path)
+        try:
+            # Use cached DirEntry stat data rather than querying each path again.
+            st = retry_io(lambda:entry.stat(follow_symlinks=False))
+            if stat.S_ISLNK(st.st_mode) or getattr(st,"st_file_attributes",0)&0x400:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                if entry.name.casefold() not in excluded:
+                    children.append(p)
+            elif stat.S_ISREG(st.st_mode):
+                files.append((p, st))
+        except OSError as e:
+            failures.append((f"无法读取文件信息 {p}: {e}", e))
+    return files, children, failures
+
+
+def walk(root: Path, errors=None, progress=None, exclude_dirs=(), workers=1):
+    """Enumerate directories concurrently; collect failures before any cleanup."""
     no_link_ancestors(root)
     if not root.is_dir():
         raise OSError(f"目录不可访问: {root}")
     stack = [root]
     excluded = {x.casefold() for x in exclude_dirs}
-    while stack:
-        folder = stack.pop()
-        if progress:
-            progress("读取目录",str(folder))
-        def enumerate_folder():
-            try:
-                with os.scandir(folder) as it:
-                    return list(it)
-            except OSError as e:
-                if getattr(e,"winerror",None)==2 and folder.is_dir():
-                    # Some virtual Windows filesystems omit dot entries for empty
-                    # directories. FindFirstFile then returns FILE_NOT_FOUND;
-                    # listdir follows Windows' empty-directory convention. Confirm
-                    # both directory existence and the independent empty listing.
-                    if not os.listdir(folder):
-                        return []
-                raise
+    def accept(result):
+        files, children, failures = result
+        if failures and errors is None:
+            raise failures[0][1]
+        if errors is not None:
+            errors.extend(message for message, _ in failures)
+        stack.extend(children)
+        return files
+    if workers == 1:
+        while stack:
+            folder = stack.pop()
+            if progress:
+                progress("读取目录", str(folder))
+            yield from accept(_read_directory(folder, excluded))
+        return
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="media-scan") as pool:
+        pending = set()
         try:
-            entries = retry_io(enumerate_folder)
-        except OSError as e:
-            if errors is None:
-                raise
-            errors.append(f"无法枚举 {folder}: {e}")
-            continue
-        for entry in entries:
-            p = Path(entry.path)
-            try:
-                # DirEntry caches Windows FindFirstFile data. Calling Path.lstat
-                # here would force a costly extra virtual-drive query per file.
-                st = retry_io(lambda:entry.stat(follow_symlinks=False))
-                if stat.S_ISLNK(st.st_mode) or getattr(st,"st_file_attributes",0)&0x400:
-                    continue
-                if stat.S_ISDIR(st.st_mode):
-                    if entry.name.casefold() not in excluded:
-                        stack.append(p)
-                elif stat.S_ISREG(st.st_mode):
-                    yield p, st
-            except OSError as e:
-                if errors is None:
-                    raise
-                errors.append(f"无法读取文件信息 {p}: {e}")
-                continue
+            while stack or pending:
+                while stack and len(pending) < workers * 2:
+                    folder = stack.pop()
+                    if progress:
+                        progress("读取目录", str(folder))
+                    pending.add(pool.submit(_read_directory, folder, excluded))
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    yield from accept(future.result())
+        finally:
+            for future in pending:
+                future.cancel()
 
 
 def file_hash(path: Path):

@@ -114,7 +114,7 @@ class EngineTests(Fixture):
 
     def test_partial_listing_never_deletes(self):
         self.file('Movie.mkv'); self.engine.scan(self.lib)
-        def broken(_,errors=None,progress=None,exclude_dirs=()):
+        def broken(_,errors=None,progress=None,exclude_dirs=(),workers=1):
             yield self.source/'x',None
             raise PermissionError('remote listing failed')
         with patch('bridge.engine.walk',broken),self.assertRaises(PermissionError):

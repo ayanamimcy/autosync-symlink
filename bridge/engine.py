@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import threading
 import time
 from urllib.parse import quote
 import uuid
 
 from .paths import file_hash, is_link, no_link_ancestors, safe_join, walk
 from .mounts import identities, assert_unchanged
+from .parallel import bounded_map
 
 VIDEOS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg", ".webm", ".iso"}
 METADATA = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".xml"}
@@ -19,6 +21,7 @@ class Engine:
     def __init__(self, state, config, progress=None):
         self.state, self.config = state, config
         self.progress = progress or (lambda *_:None)
+        self.directory_lock = threading.Lock()
 
     def health(self, lib):
         identities(lib)
@@ -53,6 +56,11 @@ class Engine:
                 and file_hash(dest) == row["fingerprint"])
 
     def mkdirs(self, root, dest):
+        # Sibling file workers can discover the same new parent directory.
+        with self.directory_lock:
+            self._mkdirs(root, dest)
+
+    def _mkdirs(self, root, dest):
         no_link_ancestors(root)
         root.mkdir(parents=True,exist_ok=True)
         cur = root
@@ -63,7 +71,87 @@ class Engine:
                 self.state.execute("INSERT OR IGNORE INTO dirs VALUES(?,?)",(str(root),cur.relative_to(root).as_posix()))
             no_link_ancestors(cur)
 
+    def apply_file(self, lib, item, row, mount_ids, now, dry_run, aborted):
+        p, st, rel, kind, dest_rel = item
+        source, output = Path(lib["source"]), Path(lib["output"])
+        stage = "复制元数据" if kind == "metadata" else "生成索引"
+        def checkpoint():
+            if aborted.is_set():
+                raise InterruptedError("并发扫描已停止，等待下次对账")
+            assert_unchanged(lib, mount_ids)
+            self.progress(stage, str(p))
+        checkpoint()
+        dest = safe_join(output, dest_rel)
+        sig = f"{st.st_size}:{st.st_mtime_ns}:{kind}:{lib['strm_prefix']}"
+        exists = os.path.lexists(dest)
+        if row and row["dest"] != dest_rel:
+            return None, f"{rel}: 修改输出模式请使用新的媒体库 id"
+        if exists and (not row or not self.owned(dest, row)):
+            return None, f"{dest_rel}: 保留非托管或已被修改的文件"
+        verify_due = (kind == "metadata" and row and
+                      now-row.get("verified_at", 0) >= self.config["sync"]["metadata_verify_seconds"])
+        if row and exists and row["source_sig"] == sig and not verify_due:
+            if row["missing_since"] is not None and not dry_run:
+                checkpoint()
+                self.state.execute("UPDATE files SET missing_since=NULL WHERE library=? AND rel=?", (lib["id"], rel))
+            return None, None
+        if kind == "symlink":
+            payload = str(p.absolute()); fingerprint = payload
+        elif kind == "strm":
+            prefix = lib["strm_prefix"]
+            text = prefix.rstrip("/")+"/"+quote(rel, safe="/") if prefix else str(p.absolute())
+            payload = (text+"\n").encode("utf-8")
+            fingerprint = hashlib.sha256(payload).hexdigest()
+        else:
+            if st.st_size > self.config["sync"]["metadata_max_mb"]*1024*1024:
+                return None, f"{rel}: 元数据超出大小限制"
+            payload = None; fingerprint = None
+        change = {"action": "更新" if row else "创建", "path": dest_rel}
+        if dry_run:
+            return change, None
+        checkpoint()
+        self.mkdirs(output, dest)
+        temp = dest.with_name(".bridge-"+uuid.uuid4().hex+".tmp")
+        try:
+            if kind == "symlink":
+                os.symlink(payload, temp)
+                # Persist the OS representation, including Windows NT prefixes.
+                fingerprint = os.readlink(temp)
+            elif kind == "strm":
+                with temp.open("xb") as f:
+                    f.write(payload); f.flush(); os.fsync(f.fileno())
+            else:
+                with p.open("rb") as f:
+                    payload = f.read(self.config["sync"]["metadata_max_mb"]*1024*1024+1)
+                if len(payload) > self.config["sync"]["metadata_max_mb"]*1024*1024:
+                    raise OSError("元数据读取超限")
+                after = p.stat()
+                if (after.st_size, after.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+                    raise OSError("源文件仍在变动，等待下次重试")
+                fingerprint = hashlib.sha256(payload).hexdigest()
+                if row and exists and fingerprint == row["fingerprint"]:
+                    checkpoint()
+                    self.state.record(self.config, (lib["id"], rel, str(output), dest_rel, str(source), sig, kind, fingerprint))
+                    return None, None
+                with temp.open("xb") as f:
+                    f.write(payload); f.flush(); os.fsync(f.fileno())
+            checkpoint()
+            if os.path.lexists(dest) and (not row or not self.owned(dest, row)):
+                raise OSError("输出文件被其他程序修改，已保留")
+            os.replace(temp, dest)
+            self.state.record(self.config, (lib["id"], rel, str(output), dest_rel, str(source), sig, kind, fingerprint), changed=True)
+        except InterruptedError:
+            raise
+        except Exception as e:
+            # A lost/replaced mount is fatal for the whole scan, including cleanup.
+            assert_unchanged(lib, mount_ids)
+            return None, f"{dest_rel}: {type(e).__name__} {e}"
+        finally:
+            temp.unlink(missing_ok=True)
+        return change, None
+
     def scan(self, lib, scope="", cleanup=False, dry_run=False):
+        started = time.monotonic()
         mount_ids = identities(lib)
         self.health(lib)
         source, output = Path(lib["source"]),Path(lib["output"])
@@ -85,7 +173,9 @@ class Engine:
         else:
             if not stat.S_ISDIR(mode):
                 raise OSError("扫描范围不再是目录，已停止处理")
-            files = list(walk(base,errors=listing_errors,progress=self.progress,exclude_dirs=excluded))
+            files = list(walk(base,errors=listing_errors,progress=self.progress,exclude_dirs=excluded,
+                              workers=self.config["sync"]["scan_workers"]))
+        files.sort(key=lambda item: item[0].as_posix())
         assert_unchanged(lib, mount_ids)
         seen, changes, errors, deferred = set(), [], list(listing_errors), 0
         rows = {r["rel"]:r for r in self.state.rows(lib["id"])}
@@ -93,7 +183,7 @@ class Engine:
             raise ValueError("该库已有文件清单，修改目录时请新建不同 id 的库")
         now = time.time()
         # Build and validate the entire listing before applying anything.
-        planned, dests = [], set()
+        planned, dests, parents = [], set(), set()
         for p, st in files:
             ext = p.suffix.lower()
             if ext not in VIDEOS | METADATA:
@@ -105,80 +195,37 @@ class Engine:
             kind = lib["mode"] if ext in VIDEOS else "metadata"
             dest_rel = str(Path(rel).with_suffix(".strm")).replace("\\","/") if kind == "strm" else rel
             # Case-fold catches Windows collisions even in tests on POSIX.
-            if dest_rel.casefold() in dests:
+            name = dest_rel.casefold()
+            ancestors = {p.as_posix() for p in PurePosixPath(name).parents if p.as_posix() != "."}
+            if name in dests or name in parents or ancestors & dests:
                 raise ValueError(f"输出文件名冲突，整个扫描已停止: {dest_rel}")
-            dests.add(dest_rel.casefold())
+            dests.add(name); parents.update(ancestors)
             safe_join(output,dest_rel)
             planned.append((p,st,rel,kind,dest_rel))
-        for p, st, rel, kind, dest_rel in planned:
-            assert_unchanged(lib, mount_ids)
-            self.progress("复制元数据" if kind=="metadata" else "生成索引",str(p))
-            row = rows.get(rel)
-            dest = safe_join(output,dest_rel)
-            sig = f"{st.st_size}:{st.st_mtime_ns}:{kind}:{lib['strm_prefix']}"
-            exists = os.path.lexists(dest)
-            if row and row["dest"] != dest_rel:
-                errors.append(f"{rel}: 修改输出模式请使用新的媒体库 id"); continue
-            if exists and (not row or not self.owned(dest,row)):
-                errors.append(f"{dest_rel}: 保留非托管或已被修改的文件"); continue
-            verify_due = (kind == "metadata" and row and
-                          now-row.get("verified_at", 0) >= self.config["sync"]["metadata_verify_seconds"])
-            if row and exists and row["source_sig"] == sig and not verify_due:
-                if row["missing_since"] is not None and not dry_run:
-                    self.state.execute("UPDATE files SET missing_since=NULL WHERE library=? AND rel=?",(lib["id"],rel))
-                continue
-            if kind == "symlink":
-                payload = str(p.absolute()); fingerprint = payload
-            elif kind == "strm":
-                prefix = lib["strm_prefix"]
-                text = prefix.rstrip("/")+"/"+quote(rel,safe="/") if prefix else str(p.absolute())
-                payload = (text+"\n").encode("utf-8")
-                fingerprint = hashlib.sha256(payload).hexdigest()
-            else:
-                if st.st_size > self.config["sync"]["metadata_max_mb"]*1024*1024:
-                    errors.append(f"{rel}: 元数据超出大小限制"); continue
-                payload = None; fingerprint = None
-            changes.append({"action":"更新" if row else "创建", "path":dest_rel})
-            if dry_run:
-                continue
-            self.mkdirs(output,dest)
-            temp = dest.with_name(".bridge-"+uuid.uuid4().hex+".tmp")
+        aborted = threading.Event()
+        failure_lock, failures = threading.Lock(), []
+        def process(item):
             try:
-                if kind == "symlink":
-                    os.symlink(payload,temp)
-                    # Windows may expose an NT/extended path prefix via readlink.
-                    # Persist the OS representation so future ownership checks match.
-                    fingerprint = os.readlink(temp)
-                elif kind == "strm":
-                    with temp.open("xb") as f:
-                        f.write(payload); f.flush(); os.fsync(f.fileno())
-                else:
-                    # Bound reads even if the source grows after stat().
-                    with p.open("rb") as f:
-                        payload = f.read(self.config["sync"]["metadata_max_mb"]*1024*1024+1)
-                    if len(payload) > self.config["sync"]["metadata_max_mb"]*1024*1024:
-                        raise OSError("元数据读取超限")
-                    after = p.stat()
-                    if (after.st_size,after.st_mtime_ns) != (st.st_size,st.st_mtime_ns):
-                        raise OSError("源文件仍在变动，等待下次重试")
-                    fingerprint = hashlib.sha256(payload).hexdigest()
-                    if row and exists and fingerprint == row["fingerprint"]:
-                        self.state.record(self.config,(lib["id"],rel,str(output),dest_rel,str(source),sig,kind,fingerprint))
-                        changes.pop()
-                        continue
-                    with temp.open("xb") as f:
-                        f.write(payload); f.flush(); os.fsync(f.fileno())
-                # Re-check external changes immediately before replacing.
-                assert_unchanged(lib, mount_ids)
-                if os.path.lexists(dest) and (not row or not self.owned(dest,row)):
-                    raise OSError("输出文件被其他程序修改，已保留")
-                os.replace(temp,dest)
-                self.state.record(self.config,(lib["id"],rel,str(output),dest_rel,str(source),sig,kind,fingerprint),changed=True)
-            except Exception as e:
-                changes.pop()
-                errors.append(f"{dest_rel}: {type(e).__name__} {e}")
-            finally:
-                temp.unlink(missing_ok=True)
+                return self.apply_file(lib, item, rows.get(item[2]), mount_ids, now, dry_run, aborted)
+            except BaseException as error:
+                with failure_lock:
+                    if not aborted.is_set():
+                        failures.append(error)
+                    aborted.set()
+                raise
+        # Workers return independent results; only this coordinator builds totals.
+        # bounded_map drains/cancels the pool before propagating any fatal error.
+        try:
+            for change, error in bounded_map(process, planned, self.config["sync"]["file_workers"]):
+                if change:
+                    changes.append(change)
+                if error:
+                    errors.append(error)
+        except BaseException:
+            if failures:
+                raise failures[0]
+            raise
+        assert_unchanged(lib, mount_ids)
         if cleanup and listing_errors:
             errors.append("目录快照不完整：本次仅创建/更新可读文件，已暂停所有清理")
         if cleanup and not listing_errors:
@@ -212,9 +259,11 @@ class Engine:
                 if not dry_run:
                     self.prune(output)
         result = {"library":lib["id"],"scope":scope,"seen":len(seen),"changes":changes[:500],
-                  "change_count":len(changes),"deferred":deferred,"scan_complete":not listing_errors,"errors":errors[:100],"dry_run":dry_run}
+                  "change_count":len(changes),"elapsed_seconds":round(time.monotonic()-started,3),
+                  "deferred":deferred,"scan_complete":not listing_errors,"errors":errors[:100],"dry_run":dry_run}
         if not dry_run:
-            self.state.log("WARN" if errors else "INFO",f"{lib['name']}: 扫描 {len(seen)}，变更 {len(changes)}，问题 {len(errors)}" + ("；"+"；".join(errors[:3]) if errors else ""))
+            self.state.log("WARN" if errors else "INFO",f"{lib['name']}: 扫描 {len(seen)}，变更 {len(changes)}，问题 {len(errors)}，耗时 {result['elapsed_seconds']} 秒"
+                           f"（目录 {self.config['sync']['scan_workers']} / 文件 {self.config['sync']['file_workers']} 线程）" + ("；"+"；".join(errors[:3]) if errors else ""))
         return result
 
     def prune(self, root):

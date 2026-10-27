@@ -23,6 +23,11 @@ async function loadConfig(){cfg=await api('/api/config');renderConfig();}
 function renderConfig(){
  $('#cloud-url').value=cfg.cloud.url;$('#cloud-token').value=cfg.cloud.token;$('#cloud-enabled').checked=cfg.cloud.enabled;
  $('#config-json').value=JSON.stringify(cfg,null,2);
+ $('#sync-config').replaceChildren();
+ for(const [key,label] of [['scan_workers','目录扫描线程数'],['file_workers','文件处理线程数']]){
+  const f=field(label,cfg.sync[key],'number');f.input.min='1';f.input.max='32';f.input.step='1';f.input.required=true;
+  f.input.addEventListener('input',()=>{cfg.sync[key]=Number(f.input.value);});$('#sync-config').append(f.label);
+ }
  $('#library-config').replaceChildren();$('#server-config').replaceChildren();
  for(const lib of cfg.libraries){const p=el('article','panel'),grid=el('div','form-grid');p.append(el('h3','',lib.name+' / '+lib.id));
   for(const [key,label,type] of [['source','视频源目录','text'],['output','软链接输出目录','text'],['cloud_path','CloudDrive 虚拟路径（可留空自动识别）','text'],['enabled','启用此媒体库','checkbox']]){const f=field(label,lib[key],type);f.input.addEventListener('input',()=>{lib[key]=type==='checkbox'?f.input.checked:f.input.value;});grid.append(f.label);}

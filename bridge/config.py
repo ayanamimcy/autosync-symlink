@@ -12,6 +12,7 @@ DEFAULT = {
     "cloud": {"enabled": False, "url": "http://127.0.0.1:19798", "token": "",
               "username": "", "password": "", "reconnect_seconds": 10},
     "sync": {"interval_seconds": 900, "debounce_seconds": 3, "settle_seconds": 15,
+             "scan_workers": 4, "file_workers": 4,
              "cleanup_enabled": False, "watch_mode": "auto", "watch_poll_seconds": 30,
              "metadata_verify_seconds": 3600,
              "delete_grace_seconds": 3600, "max_delete_fraction": 0.2,
@@ -109,7 +110,8 @@ def validate(c, data_dir=None):
     for key, low, high in [("interval_seconds", 10, 86400), ("debounce_seconds", 1, 60),
                             ("settle_seconds", 0, 3600), ("delete_grace_seconds", 0, 604800),
                             ("metadata_max_mb", 1, 256), ("watch_poll_seconds", 1, 86400),
-                            ("metadata_verify_seconds", 0, 604800)]:
+                            ("metadata_verify_seconds", 0, 604800),
+                            ("scan_workers", 1, 32), ("file_workers", 1, 32)]:
         if not integer(c["sync"][key], low, high):
             raise ValueError(f"{key} 必须是 {low}–{high} 之间的整数")
     if type(c["sync"]["max_delete_fraction"]) not in (int, float) or not 0 < c["sync"]["max_delete_fraction"] <= 1:
@@ -207,7 +209,8 @@ def load(path):
         atomic_json(path, DEFAULT)
     config = json.loads(path.read_text(encoding="utf-8-sig"))
     # Only migrate fields introduced by this version; unknown fields still fail validation.
-    for key in ("cleanup_enabled", "watch_mode", "watch_poll_seconds", "metadata_verify_seconds"):
+    for key in ("cleanup_enabled", "watch_mode", "watch_poll_seconds", "metadata_verify_seconds",
+                "scan_workers", "file_workers"):
         config.get("sync", {}).setdefault(key, DEFAULT["sync"][key])
     for lib in config.get("libraries", []):
         lib.setdefault("mount_root", ""); lib.setdefault("output_mount_root", "")

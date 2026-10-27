@@ -31,7 +31,9 @@
       "System Volume Information",
       "@Recycle",
       "#recycle"
-    ]
+    ],
+    "scan_workers": 4,
+    "file_workers": 4
   },
   "libraries": [
     {
