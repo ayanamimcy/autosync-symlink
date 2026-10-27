@@ -1,0 +1,17 @@
+.venv/
+data/
+__pycache__/
+*.pyc
+.DS_Store
+.local-demo/
+.env
+.env.*
+!.env.example
+*.sqlite3*
+*.key
+*.log
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.coverage

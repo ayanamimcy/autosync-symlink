@@ -1,0 +1,80 @@
+{
+  "web": {
+    "host": "0.0.0.0",
+    "port": 8095
+  },
+  "cloud": {
+    "enabled": false,
+    "url": "http://127.0.0.1:19798",
+    "token": "",
+    "username": "",
+    "password": "",
+    "reconnect_seconds": 10
+  },
+  "sync": {
+    "interval_seconds": 900,
+    "debounce_seconds": 3,
+    "settle_seconds": 15,
+    "cleanup_enabled": false,
+    "watch_mode": "auto",
+    "watch_poll_seconds": 30,
+    "metadata_verify_seconds": 3600,
+    "delete_grace_seconds": 3600,
+    "max_delete_fraction": 0.2,
+    "allow_empty_cleanup": false,
+    "metadata_max_mb": 32,
+    "exclude_directories": [
+      "_trash",
+      ".deletedByTMM",
+      ".Trash",
+      "$RECYCLE.BIN",
+      "System Volume Information",
+      "@Recycle",
+      "#recycle"
+    ]
+  },
+  "libraries": [
+    {
+      "id": "pt",
+      "name": "PT 媒体库",
+      "enabled": false,
+      "source": "/mnt/clouddrive/pt",
+      "output": "/srv/media/library/pt",
+      "mount_root": "",
+      "output_mount_root": "",
+      "cloud_path": "",
+      "mode": "symlink",
+      "strm_prefix": "",
+      "sentinel": ".media-bridge-ready"
+    }
+  ],
+  "servers": [
+    {
+      "id": "plex",
+      "kind": "plex",
+      "enabled": false,
+      "url": "http://127.0.0.1:32400",
+      "token": "",
+      "section_id": "",
+      "libraries": [
+        "pt"
+      ],
+      "path_from": "",
+      "path_to": ""
+    },
+    {
+      "id": "jellyfin",
+      "kind": "jellyfin",
+      "enabled": false,
+      "url": "http://127.0.0.1:8096",
+      "token": "",
+      "section_id": "",
+      "libraries": [
+        "pt"
+      ],
+      "path_from": "",
+      "path_to": ""
+    }
+  ],
+  "transfers": []
+}

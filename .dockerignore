@@ -1,0 +1,14 @@
+.git
+.venv
+.local-demo
+data
+__pycache__
+**/__pycache__
+*.pyc
+.env*
+*.key
+*.sqlite3*
+dist
+build
+.DS_Store
+*.bundle

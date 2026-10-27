@@ -1,0 +1,42 @@
+# Confirm the image build succeeded and configure registry access before deployment.
+# All paths below belong to that managed host, not the Oracle Portainer server.
+services:
+  autosync:
+    image: ${AUTOSYNC_IMAGE:-ghcr.io/ayanamimcy/autosync-symlink:edge}
+    user: "${PUID:-1000}:${PGID:-1000}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      TZ: Asia/Tokyo
+      AUTOSYNC_DATA_DIR: /data
+    ports:
+      - "${AUTOSYNC_BIND_IP:-127.0.0.1}:8095:8095"
+    volumes:
+      - type: bind
+        source: /srv/appdata/autosync-symlink
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/clouddrive
+        target: /mnt/clouddrive
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: false
+      - type: bind
+        source: /srv/media/library
+        target: /srv/media/library
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

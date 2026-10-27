@@ -1,0 +1,110 @@
+{
+  "web": {
+    "host": "0.0.0.0",
+    "port": 8095
+  },
+  "cloud": {
+    "enabled": false,
+    "url": "http://host.docker.internal:19798",
+    "token": "",
+    "username": "",
+    "password": "",
+    "reconnect_seconds": 10
+  },
+  "sync": {
+    "interval_seconds": 900,
+    "debounce_seconds": 3,
+    "settle_seconds": 15,
+    "cleanup_enabled": false,
+    "watch_mode": "auto",
+    "watch_poll_seconds": 30,
+    "metadata_verify_seconds": 3600,
+    "delete_grace_seconds": 3600,
+    "max_delete_fraction": 0.2,
+    "allow_empty_cleanup": false,
+    "metadata_max_mb": 32,
+    "exclude_directories": [
+      "_trash",
+      ".deletedByTMM",
+      ".Trash",
+      "$RECYCLE.BIN",
+      "System Volume Information",
+      "@Recycle",
+      "#recycle"
+    ]
+  },
+  "libraries": [
+    {
+      "id": "movie",
+      "name": "电影",
+      "enabled": true,
+      "source": "/mnt/clouddrive/115/pt/movie",
+      "output": "/srv/media/library/movie",
+      "mount_root": "/mnt/clouddrive/115",
+      "output_mount_root": "",
+      "cloud_path": "/115/pt/movie",
+      "mode": "symlink",
+      "strm_prefix": "",
+      "sentinel": ".media-bridge-ready"
+    },
+    {
+      "id": "tv",
+      "name": "电视剧",
+      "enabled": true,
+      "source": "/mnt/clouddrive/115/pt/tv",
+      "output": "/srv/media/library/tv",
+      "mount_root": "/mnt/clouddrive/115",
+      "output_mount_root": "",
+      "cloud_path": "/115/pt/tv",
+      "mode": "symlink",
+      "strm_prefix": "",
+      "sentinel": ".media-bridge-ready"
+    },
+    {
+      "id": "bangumi",
+      "name": "番剧",
+      "enabled": true,
+      "source": "/mnt/clouddrive/115/pt/bangumi",
+      "output": "/srv/media/library/bangumi",
+      "mount_root": "/mnt/clouddrive/115",
+      "output_mount_root": "",
+      "cloud_path": "/115/pt/bangumi",
+      "mode": "symlink",
+      "strm_prefix": "",
+      "sentinel": ".media-bridge-ready"
+    }
+  ],
+  "servers": [
+    {
+      "id": "plex",
+      "kind": "plex",
+      "enabled": false,
+      "url": "http://127.0.0.1:32400",
+      "token": "",
+      "section_id": "",
+      "libraries": [
+        "movie",
+        "tv",
+        "bangumi"
+      ],
+      "path_from": "",
+      "path_to": ""
+    },
+    {
+      "id": "jellyfin",
+      "kind": "jellyfin",
+      "enabled": false,
+      "url": "http://127.0.0.1:8096",
+      "token": "",
+      "section_id": "",
+      "libraries": [
+        "movie",
+        "tv",
+        "bangumi"
+      ],
+      "path_from": "",
+      "path_to": ""
+    }
+  ],
+  "transfers": []
+}

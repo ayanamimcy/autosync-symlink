@@ -1,0 +1,3 @@
+# Core synchronization, gRPC-Web, HTTP UI and tests use the Python standard library.
+# Pillow is used only for PNG cover generation.
+Pillow==12.3.0
