@@ -36,7 +36,11 @@ class LocalIntegration(unittest.TestCase):
             Engine(state, config).initialize(lib); state.db.close()
             (source/"first.mkv").write_bytes(b"video-placeholder")
             (source/"movie.nfo").write_bytes(b"old")
-            command = [sys.executable, "run.py", "--data-dir", str(data), "serve"]
+            # Keep a traceback if a shared runner stalls during service startup.
+            launch = ("import faulthandler, runpy; "
+                      "faulthandler.dump_traceback_later(20, repeat=True); "
+                      "runpy.run_path('run.py', run_name='__main__')")
+            command = [sys.executable, "-c", launch, "--data-dir", str(data), "serve"]
             base = f"http://127.0.0.1:{port}"
             service_log = tempfile.TemporaryFile()
             self.addCleanup(service_log.close)
@@ -69,7 +73,7 @@ class LocalIntegration(unittest.TestCase):
                     time.sleep(.15)
                 self.fail(f"local integration condition timed out; last error: {last_error!r}\n{diagnostics()}")
             try:
-                wait_for(lambda: request("/healthz")["ok"])
+                wait_for(lambda: request("/healthz")["ok"], timeout=60)
                 request("/api/login", {"key": (data/"admin.key").read_text()})
                 wait_for(lambda: request("/api/status")["libraries"][0]["scan"]["last_full_success"])
                 self.assertTrue((root/"library/first.mkv").is_symlink())
@@ -84,7 +88,7 @@ class LocalIntegration(unittest.TestCase):
                 process.terminate(); process.wait(timeout=10)
                 self.assertEqual(process.returncode, 0)
                 process = start()
-                wait_for(lambda: request("/healthz")["ok"])
+                wait_for(lambda: request("/healthz")["ok"], timeout=60)
                 request("/api/login", {"key": (data/"admin.key").read_text()})
                 self.assertIsNotNone(request("/api/status")["libraries"][0]["scan"]["last_full_success"])
             finally:
