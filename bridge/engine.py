@@ -31,8 +31,16 @@ class Engine:
         if not source.is_dir():
             raise OSError("CloudDrive 挂载或媒体源不可访问")
         marker = source/lib["sentinel"]
-        if is_link(marker) or marker.read_text(encoding="utf-8").strip() != "media-bridge:"+lib["id"]:
-            raise OSError("源目录健康标记缺失或不匹配，请先初始化标记")
+        if is_link(marker):
+            raise OSError(f"{lib['name']} ({lib['id']}): 源目录健康标记不能是链接：{marker}")
+        try:
+            content = marker.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as error:
+            raise OSError(f"{lib['name']} ({lib['id']}): 源目录健康标记缺失：{marker}；"
+                          "先确认 CloudDrive 挂载和源目录正确，再初始化该库标记；只读源挂载请在宿主机初始化") from error
+        if content != "media-bridge:"+lib["id"]:
+            raise OSError(f"{lib['name']} ({lib['id']}): 源目录健康标记内容不匹配：{marker}；"
+                          f"应为 media-bridge:{lib['id']}，请核对库 id 和源目录")
 
     def initialize(self, lib):
         identities(lib)

@@ -1,4 +1,4 @@
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
 import stat
@@ -21,11 +21,17 @@ def no_link_ancestors(path: Path):
 
 
 def safe_join(root: Path, relative: str):
-    if "\\" in relative or ":" in relative or "\x00" in relative:
-        raise ValueError("不安全的相对路径")
+    if "\x00" in relative:
+        raise ValueError(f"不安全的相对路径 {relative!r}：包含 NUL 字符")
+    if "\\" in relative:
+        raise ValueError(f"不安全的相对路径 {relative!r}：不支持反斜杠，请使用正斜杠分隔目录")
+    # A colon is a literal filename character on POSIX, but can select a drive
+    # or an NTFS alternate data stream on Windows. Check the target path flavor.
+    if isinstance(root, PureWindowsPath) and ":" in relative:
+        raise ValueError(f"不安全的 Windows 相对路径 {relative!r}：包含冒号、盘符或数据流")
     p = PurePosixPath(relative)
     if p.is_absolute() or ".." in p.parts:
-        raise ValueError("相对路径不能越界")
+        raise ValueError(f"相对路径不能越界：{relative!r}")
     target = root.joinpath(*p.parts)
     no_link_ancestors(target.parent)
     return target

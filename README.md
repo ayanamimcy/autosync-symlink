@@ -56,6 +56,8 @@ python3 -m venv .venv
 
 在独立新输出目录及新运行状态下首次导入。源标记需要先初始化；容器默认把源只读挂载，因此应在宿主机完成初始化，或由管理员在已确认挂载的源目录创建精确内容为 `media-bridge:<library-id>` 的 `.media-bridge-ready` 文件。不能在未挂载的空目录中创建标记。
 
+每个媒体库的源根目录都需要自己的标记；新增 YouTube 等媒体库后也需要初始化。缺少标记时，先确认实际挂载和配置路径，再初始化；标记内容中的 id 必须与配置一致。Linux 输出支持文件名中的冒号；Windows 输出仍拒绝冒号、盘符和数据流。相对路径中的反斜杠、NUL、绝对路径和 `..` 会被拒绝，错误会指出具体路径。
+
 ```sh
 .venv/bin/python run.py --data-dir data initialize --library movie
 .venv/bin/python run.py --data-dir data check
