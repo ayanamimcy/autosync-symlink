@@ -81,6 +81,10 @@ class State:
                                      (library, scope, time.time()))
             return cursor.lastrowid
 
+    def update_scan_progress(self, scan_id, progress):
+        self.execute("UPDATE scans SET seen=?,changes=?,deferred=? WHERE id=? AND status='running'",
+                     (progress["seen"], progress["changes"], progress["deferred"], scan_id))
+
     def finish_scan(self, scan_id, result=None, error=None):
         result = result or {}
         status = "failed" if error else ("complete" if result.get("scan_complete") and not result.get("errors")

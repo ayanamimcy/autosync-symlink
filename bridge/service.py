@@ -24,6 +24,8 @@ class Service:
         self.state = State(self.data_dir/"state.sqlite3")
         self.lock = threading.RLock()
         self.queue_lock = threading.Lock()
+        self.progress_lock = threading.Lock()
+        self.scan_progress = {}
         self.pending = {}
         self.jobs = {}
         self.queue = []
@@ -136,14 +138,35 @@ class Service:
             cleanup = action in ("cleanup","preview") or options.get("cleanup",False)
             scope = options.get("scope", "")
             scan_id = self.state.begin_scan(lib["id"], scope) if action != "preview" else None
+            last_checkpoint, last_stage = 0, None
+            def update_progress(snapshot):
+                nonlocal last_checkpoint, last_stage
+                with self.progress_lock:
+                    self.scan_progress[lib["id"]] = {**snapshot, "scan_id":scan_id}
+                now = time.monotonic()
+                # Keep UI counters current without committing SQLite for each file.
+                if scan_id is not None and (now-last_checkpoint >= 1 or snapshot["stage"] != last_stage):
+                    self.state.update_scan_progress(scan_id, snapshot)
+                    last_checkpoint, last_stage = now, snapshot["stage"]
+            engine = Engine(self.state, self.config, self.progress,
+                            scan_progress=update_progress if scan_id is not None else None)
             try:
                 result = engine.scan(lib,scope=scope,cleanup=cleanup,dry_run=action=="preview")
             except Exception as e:
                 if scan_id is not None:
-                    self.state.finish_scan(scan_id, error=e)
+                    with self.progress_lock:
+                        partial = self.scan_progress.get(lib["id"], {})
+                    self.state.finish_scan(scan_id, {"seen":partial.get("seen",0),
+                                                    "change_count":partial.get("changes",0),
+                                                    "deferred":partial.get("deferred",0)}, error=e)
                 raise
-            if scan_id is not None:
-                self.state.finish_scan(scan_id, result)
+            else:
+                if scan_id is not None:
+                    self.state.finish_scan(scan_id, result)
+            finally:
+                if scan_id is not None:
+                    with self.progress_lock:
+                        self.scan_progress.pop(lib["id"], None)
             results.append(result)
             if action != "preview" and not result.get("skipped"):
                 self.last_results[lib["id"]] = {"at":time.time(),**result}
@@ -248,6 +271,8 @@ class Service:
             self.stop_event.wait(5)
 
     def status(self):
+        with self.progress_lock:
+            live_progress = copy.deepcopy(self.scan_progress)
         with self.queue_lock:
             jobs = copy.deepcopy(list(self.jobs.values())[-20:])
             pending = len(self.pending)+len(self.queue)
@@ -258,7 +283,8 @@ class Service:
                 "pending_notifications":self.state.query("SELECT COUNT(*) AS n FROM notices")[0]["n"],
                 "libraries":[{"id":x["id"],"name":x["name"],"enabled":x["enabled"],"source":x["source"],
                               "output":x["output"],"mode":x["mode"],"cloud_path":self.cloud_paths.get(x["id"]),
-                              "last":self.last_results.get(x["id"]),"scan":self.state.scan_status(x["id"])} for x in self.config["libraries"]],
+                              "last":self.last_results.get(x["id"]),"scan":self.state.scan_status(x["id"]),
+                              "progress":live_progress.get(x["id"])} for x in self.config["libraries"]],
                 "jobs":jobs}
 
     def stop(self):

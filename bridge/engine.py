@@ -18,10 +18,11 @@ METADATA = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".srt", ".ass", ".ssa", ".
 
 
 class Engine:
-    def __init__(self, state, config, progress=None):
+    def __init__(self, state, config, progress=None, scan_progress=None):
         self.state, self.config = state, config
         self.progress = progress or (lambda *_:None)
         self.directory_lock = threading.Lock()
+        self.scan_progress = scan_progress
 
     def health(self, lib):
         identities(lib)
@@ -104,7 +105,8 @@ class Engine:
             fingerprint = hashlib.sha256(payload).hexdigest()
         else:
             if st.st_size > self.config["sync"]["metadata_max_mb"]*1024*1024:
-                return None, f"{rel}: 元数据超出大小限制"
+                return None, (f"{rel}: 元数据大小 {st.st_size/(1024*1024):.2f} MiB，"
+                              f"超出上限 {self.config['sync']['metadata_max_mb']} MiB，已跳过")
             payload = None; fingerprint = None
         change = {"action": "更新" if row else "创建", "path": dest_rel}
         if dry_run:
@@ -124,7 +126,7 @@ class Engine:
                 with p.open("rb") as f:
                     payload = f.read(self.config["sync"]["metadata_max_mb"]*1024*1024+1)
                 if len(payload) > self.config["sync"]["metadata_max_mb"]*1024*1024:
-                    raise OSError("元数据读取超限")
+                    raise OSError(f"元数据读取超限（上限 {self.config['sync']['metadata_max_mb']} MiB）")
                 after = p.stat()
                 if (after.st_size, after.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
                     raise OSError("源文件仍在变动，等待下次重试")
@@ -152,6 +154,21 @@ class Engine:
 
     def scan(self, lib, scope="", cleanup=False, dry_run=False):
         started = time.monotonic()
+        counters = {"stage":"检查源目录", "seen":0, "processed":0, "total":None,
+                    "changes":0, "errors":0, "deferred":0, "path":lib["source"]}
+        progress_lock = threading.Lock()
+        def report(increments=None, **values):
+            if self.scan_progress is None:
+                return
+            # Completion events come from multiple file workers. Publish a fresh,
+            # coherent snapshot, even if the coordinator awaits an earlier file.
+            with progress_lock:
+                counters.update(values)
+                for key, amount in (increments or {}).items():
+                    counters[key] += amount
+                counters["updated"] = time.time()
+                self.scan_progress(dict(counters))
+        report()
         mount_ids = identities(lib)
         self.health(lib)
         source, output = Path(lib["source"]),Path(lib["output"])
@@ -173,10 +190,18 @@ class Engine:
         else:
             if not stat.S_ISDIR(mode):
                 raise OSError("扫描范围不再是目录，已停止处理")
-            files = list(walk(base,errors=listing_errors,progress=self.progress,exclude_dirs=excluded,
-                              workers=self.config["sync"]["scan_workers"]))
+            def reading(stage, path):
+                self.progress(stage, path)
+                report(stage=stage, path=path)
+            files = []
+            for item in walk(base,errors=listing_errors,progress=reading,exclude_dirs=excluded,
+                             workers=self.config["sync"]["scan_workers"]):
+                files.append(item)
+                if item[0].suffix.lower() in VIDEOS | METADATA:
+                    report(increments={"seen":1}, path=str(item[0]))
         files.sort(key=lambda item: item[0].as_posix())
         assert_unchanged(lib, mount_ids)
+        report(stage="校验输出计划", errors=len(listing_errors))
         seen, changes, errors, deferred = set(), [], list(listing_errors), 0
         rows = {r["rel"]:r for r in self.state.rows(lib["id"])}
         if any(r["source_root"] != str(source) or r["output_root"] != str(output) for r in rows.values()):
@@ -202,11 +227,15 @@ class Engine:
             dests.add(name); parents.update(ancestors)
             safe_join(output,dest_rel)
             planned.append((p,st,rel,kind,dest_rel))
+        report(stage="处理文件", seen=len(seen), total=len(planned), deferred=deferred)
         aborted = threading.Event()
         failure_lock, failures = threading.Lock(), []
         def process(item):
             try:
-                return self.apply_file(lib, item, rows.get(item[2]), mount_ids, now, dry_run, aborted)
+                result = self.apply_file(lib, item, rows.get(item[2]), mount_ids, now, dry_run, aborted)
+                report(increments={"processed":1, "changes":int(result[0] is not None),
+                                   "errors":int(result[1] is not None)}, path=str(item[0]))
+                return result
             except BaseException as error:
                 with failure_lock:
                     if not aborted.is_set():
@@ -226,6 +255,8 @@ class Engine:
                 raise failures[0]
             raise
         assert_unchanged(lib, mount_ids)
+        if cleanup:
+            report(stage="检查清理", errors=len(errors), changes=len(changes))
         if cleanup and listing_errors:
             errors.append("目录快照不完整：本次仅创建/更新可读文件，已暂停所有清理")
         if cleanup and not listing_errors:
@@ -261,6 +292,7 @@ class Engine:
         result = {"library":lib["id"],"scope":scope,"seen":len(seen),"changes":changes[:500],
                   "change_count":len(changes),"elapsed_seconds":round(time.monotonic()-started,3),
                   "deferred":deferred,"scan_complete":not listing_errors,"errors":errors[:100],"dry_run":dry_run}
+        report(stage="扫描结束", seen=len(seen), changes=len(changes), errors=len(errors))
         if not dry_run:
             self.state.log("WARN" if errors else "INFO",f"{lib['name']}: 扫描 {len(seen)}，变更 {len(changes)}，问题 {len(errors)}，耗时 {result['elapsed_seconds']} 秒"
                            f"（目录 {self.config['sync']['scan_workers']} / 文件 {self.config['sync']['file_workers']} 线程）" + ("；"+"；".join(errors[:3]) if errors else ""))

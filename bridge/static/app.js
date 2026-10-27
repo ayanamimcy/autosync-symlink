@@ -57,7 +57,18 @@ function renderStatus(s){
  for(const lib of s.libraries){const n=$('#library-template').content.firstElementChild.cloneNode(true);n.querySelector('.name').textContent=lib.name;n.querySelector('.source').textContent=lib.source;n.querySelector('.output').textContent=lib.output;n.querySelector('.mode').textContent=(lib.enabled?lib.mode.toUpperCase():'已停用');
   const scan=lib.scan?.latest,full=lib.scan?.last_full_success;
   const labels={running:'扫描中',complete:'完成',partial:'有待处理项',failed:'失败',interrupted:'中断后等待补扫'};
-  n.querySelector('.last').textContent=(full?'全量成功：'+formatTime(full):'首次全量尚未完成')+(scan?' · '+(labels[scan.status]||scan.status)+' · '+scan.seen+' 个文件':'');
+  const live=scan?.status==='running'&&lib.progress?.scan_id===scan.id?lib.progress:null;
+  let detail='';
+  if(live){
+   detail=live.stage+' · 已发现 '+live.seen.toLocaleString()+' 个文件';
+   if(live.total!==null)detail+=' · 已处理 '+live.processed.toLocaleString()+'/'+live.total.toLocaleString()+' · 变更 '+live.changes.toLocaleString();
+   if(live.errors)detail+=' · 问题 '+live.errors;
+   if(live.deferred)detail+=' · 等待稳定 '+live.deferred;
+  }else if(scan?.status==='running'){
+   detail=scan.seen?'扫描中 · 已发现 '+scan.seen.toLocaleString()+' 个文件':'扫描中 · 正在读取目录，等待进度';
+  }else if(scan){detail=(labels[scan.status]||scan.status)+(scan.status==='partial'?'（查看日志）':'')+' · 本次发现 '+scan.seen.toLocaleString()+' 个文件';}
+  n.querySelector('.last').textContent=(full?'全量成功：'+formatTime(full):'首次全量尚未完成')+(detail?' · '+detail:'');
+  n.querySelector('.last').title='本次扫描的媒体和元数据文件；顶部数字为累计托管数。'+(live?.path?' 当前路径：'+live.path:'')+(scan?.error?' 扫描问题：'+scan.error:'');
   n.querySelector('.scan').disabled=!lib.enabled;n.querySelector('.scan').addEventListener('click',()=>action('scan',lib.id).catch(e=>toast(e.message)));n.querySelector('.preview').addEventListener('click',()=>{view('tools');$('#tool-library').value=lib.id;action('preview',lib.id).catch(e=>toast(e.message));});$('#libraries').append(n);
  }
  $('#jobs').replaceChildren();for(const j of [...s.jobs].reverse().slice(0,5)){const item=el('div','list-item'),c=el('div','list-content');c.append(el('span','list-title',({scan:'同步媒体库',cleanup:'清理托管文件',preview:'预览同步与清理',initialize:'初始化源标记',transfer_initialize:'初始化转存标记'})[j.action]||j.action),el('span','list-detail',formatTime(j.created)+(j.error?' · '+j.error:'')));item.append(el('span','badge',j.status),c);$('#jobs').append(item);}if(!s.jobs.length)$('#jobs').append(el('div','empty','还没有手动任务。后台会按配置自动同步。'));
