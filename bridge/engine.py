@@ -13,7 +13,7 @@ from .paths import file_hash, is_link, no_link_ancestors, safe_join, walk
 from .mounts import identities, assert_unchanged
 from .parallel import bounded_map
 
-VIDEOS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg", ".webm", ".iso"}
+VIDEOS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg", ".webm", ".iso", ".rmvb"}
 METADATA = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".xml"}
 
 

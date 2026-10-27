@@ -47,6 +47,41 @@ class Fixture(unittest.TestCase):
 
 
 class EngineTests(Fixture):
+    def test_rmvb_symlinks_are_case_insensitive_and_do_not_read_video(self):
+        relatives = ('Series/Season 1/Series - S01E01.rmvb',
+                     'Series/Season 1/Series - S01E02.RMVB')
+        sources = [self.file(relative) for relative in relatives]
+        original_open = Path.open
+
+        def guarded_open(path, *args, **kwargs):
+            if path.suffix.lower() == '.rmvb':
+                raise AssertionError('RMVB video content read')
+            return original_open(path, *args, **kwargs)
+
+        with patch('pathlib.Path.open', guarded_open):
+            result = self.engine.scan(self.lib)
+            self.assertEqual(result['seen'], 2)
+            self.assertEqual(result['change_count'], 2)
+            self.assertFalse(result['errors'])
+            for relative, source in zip(relatives, sources):
+                link = self.output/relative
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.resolve(), source)
+            self.assertEqual(self.engine.scan(self.lib)['change_count'], 0)
+        self.assertEqual([row['kind'] for row in self.state.rows('pt')], ['symlink', 'symlink'])
+
+    def test_rmvb_strm_uses_the_original_video_url(self):
+        self.lib.update(mode='strm', strm_prefix='http://media.test/stream')
+        self.file('Series/Season 1/Series - S01E01.RMVB')
+        result = self.engine.scan(self.lib)
+        self.assertEqual(result['change_count'], 1)
+        self.assertFalse(result['errors'])
+        target = self.output/'Series/Season 1/Series - S01E01.strm'
+        self.assertEqual(target.read_text(),
+                         'http://media.test/stream/Series/Season%201/Series%20-%20S01E01.RMVB\n')
+        self.assertEqual(self.state.rows('pt')[0]['kind'], 'strm')
+        self.assertEqual(self.engine.scan(self.lib)['change_count'], 0)
+
     def test_symlink_and_real_metadata_copy(self):
         movie=self.file('Movie (2024)/Movie.mkv')
         self.file('Movie (2024)/movie.nfo',b'<movie/>')
