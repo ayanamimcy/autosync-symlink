@@ -55,6 +55,15 @@ class WebTests(unittest.TestCase):
         head,data=self.request('/api/config',cookie=self.login())
         self.assertNotIn(b'private-token',data);self.assertIn(b'********',data)
 
+    def test_configuration_save_returns_job_without_waiting_for_apply(self):
+        self.service.submit_config.return_value = {'id':'config-job', 'action':'config', 'status':'排队中'}
+        head, data = self.request('/api/config', {'cloud':{'token':'********'}}, cookie=self.login())
+        self.assertIn('202 Accepted', head)
+        self.assertEqual(json.loads(data)['id'], 'config-job')
+        self.service.submit_config.assert_called_once_with({'cloud':{'token':'private-token'}})
+        self.service.save_config.assert_not_called()
+        self.assertNotIn(b'private-token', data)
+
     def test_cross_origin_write_is_denied(self):
         head,_=self.request('/api/login',{'key':'a'*40},origin='https://other.invalid')
         self.assertIn('403 Forbidden',head)

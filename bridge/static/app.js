@@ -41,7 +41,28 @@ function renderConfig(){
  for(const selector of ['#tool-library','#cover-library']){const s=$(selector),old=s.value;s.replaceChildren();cfg.libraries.forEach(l=>{const o=el('option','',l.name);o.value=l.id;s.append(o);});if([...s.options].some(o=>o.value===old))s.value=old;}
  renderTransfers();
 }
-async function save(config){await api('/api/config',config);await loadConfig();toast('配置已保存并应用；监听端口变化需重启服务');await refresh();}
+async function save(config){
+ const buttons=[$('#save-basic'),$('#save-json')],message=$('#config-save-status');
+ buttons.forEach(b=>b.disabled=true);message.hidden=false;message.textContent='正在提交配置…';
+ try{
+  const job=await api('/api/config',config);
+  if(job.id){
+   message.textContent='配置已提交，等待当前任务结束后应用。完成前尚未写入配置文件，请勿重启服务。';
+   toast('配置已提交，正在等待应用');
+   while(true){
+    await new Promise(resolve=>setTimeout(resolve,1000));
+    if(!active)return;
+    const result=await api('/api/jobs/'+job.id);
+    if(result.status==='失败')throw Error(result.error||'配置应用失败');
+    if(result.status==='完成')break;
+    if(result.status==='运行中')message.textContent='正在保存配置并重新连接文件通知…';
+   }
+  }
+  if(!active)return;
+  await loadConfig();message.textContent='配置已保存并应用；监听端口变化需重启服务。';toast('配置已保存并应用');await refresh();
+ }catch(error){message.textContent='配置保存未完成：'+error.message;throw error;}
+ finally{buttons.forEach(b=>b.disabled=false);}
+}
 $('#save-basic').addEventListener('click',async()=>{try{cfg.cloud.url=$('#cloud-url').value;cfg.cloud.token=$('#cloud-token').value;cfg.cloud.enabled=$('#cloud-enabled').checked;await save(cfg);}catch(e){toast(e.message);}});
 $('#save-json').addEventListener('click',async()=>{try{await save(JSON.parse($('#config-json').value));}catch(e){toast(e.message);}});
 async function action(name,library,confirm=false){const job=await api('/api/actions',{action:name,library,confirm});toast('任务已加入队列');

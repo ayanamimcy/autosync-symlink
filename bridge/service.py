@@ -118,6 +118,26 @@ class Service:
                         self.jobs.pop(old); break
             return copy.deepcopy(self.jobs[key])
 
+    def submit_config(self, config):
+        # HTTP requests must not wait for the worker's long-running scan lock.
+        config = copy.deepcopy(config)
+        self.validate_config_update(config)
+        with self.queue_lock:
+            if any(job["action"] == "config" and job["status"] in ("排队中", "运行中")
+                   for job in self.jobs.values()):
+                raise ValueError("已有配置正在等待应用，请等待结果后再保存")
+            if len(self.queue) >= 20:
+                raise ValueError("任务队列已满，请等待当前任务完成")
+            key = uuid.uuid4().hex
+            self.jobs[key] = {"id":key, "action":"config", "status":"排队中", "created":time.time()}
+            # Apply before the next scan, without interrupting the current one.
+            self.queue.insert(0, (key, "config", None, {"config":config}))
+            if len(self.jobs) > 100:
+                for old in list(self.jobs):
+                    if self.jobs[old]["status"] in ("完成", "失败"):
+                        self.jobs.pop(old); break
+            return copy.deepcopy(self.jobs[key])
+
     def libs(self, library=None):
         libs = [x for x in self.config["libraries"] if x["enabled"] and (not library or x["id"]==library)]
         if not libs:
@@ -184,16 +204,19 @@ class Service:
     def health(self):
         return {"ok": self.thread.is_alive() and not self.stop_event.is_set()}
 
-    def save_config(self, config):
+    def validate_config_update(self, config):
         validate(config,self.data_dir)
+        current = self.config
+        for lib in config["libraries"]:
+            if self.state.rows(lib["id"]):
+                old = next((x for x in current["libraries"] if x["id"] == lib["id"]), {})
+                if any(lib[k] != old.get(k) for k in ("source", "output", "mode")):
+                    raise ValueError("已有清单的媒体库不能修改源/输出/模式，请使用新的 id")
+
+    def save_config(self, config):
         with self.lock:
             # A manifest is tied to its exact source/output and generation mode.
-            for lib in config["libraries"]:
-                rows = self.state.rows(lib["id"])
-                if rows:
-                    old = next((x for x in self.config["libraries"] if x["id"]==lib["id"]),{})
-                    if any(lib[k] != old.get(k) for k in ("source","output","mode")):
-                        raise ValueError("已有清单的媒体库不能修改源/输出/模式，请使用新的 id")
+            self.validate_config_update(config)
             atomic_json(self.config_path,config)
             old_monitor = self.monitor
             old_monitor.stop()
@@ -235,7 +258,12 @@ class Service:
                         if key:
                             self.jobs[key]["status"] = "运行中"
                         try:
-                            result = self.perform(action,library,**options)
+                            if action == "config":
+                                self.save_config(options["config"])
+                                next_scan = time.monotonic()+self.config["sync"]["interval_seconds"]
+                                result = {"applied":True, "restart_needed":"Web 监听地址/端口修改后需重启"}
+                            else:
+                                result = self.perform(action,library,**options)
                             if key:
                                 self.jobs[key].update(status="完成",result=result)
                         except Exception as e:

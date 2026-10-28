@@ -148,8 +148,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.sessions.pop(cookie["mb_session"].value,None)
                 self.reply(200,{"ok":True},headers={"Set-Cookie":"mb_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"})
             elif path == "/api/config":
-                s.save_config(restore_secrets(data,s.config))
-                self.reply(200,{"ok":True,"restart_needed":"Web 监听地址/端口修改后需重启"})
+                job = s.submit_config(restore_secrets(data,s.config))
+                self.reply(202,job)
             elif path == "/api/actions":
                 if data.get("action") in ("initialize","transfer_initialize") and data.get("confirm") is not True:
                     raise ValueError("初始化源目录标记需要明确确认")
