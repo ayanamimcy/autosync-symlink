@@ -36,12 +36,32 @@ class Service:
         self.activity = None
         self.transfers = Transfers(self.state)
         self.monitor = self.new_monitor()
-        self.native = Monitor(self.config,self.schedule,self.state.log)
+        self.native = self.new_native()
         self.thread = threading.Thread(target=self.run,name="media-worker",daemon=True)
         self.notifier = threading.Thread(target=self.notify_run,name="media-notifier",daemon=True)
 
     def new_monitor(self):
-        return CloudMonitor(self.config["cloud"],self.change,self.reconnected,self.state.log)
+        return CloudMonitor(self.config["cloud"],self.change,self.monitor_ready(),self.state.log)
+
+    def new_native(self):
+        return Monitor(self.config,self.schedule,self.state.log,ready=self.monitor_ready())
+
+    def monitor_ready(self):
+        # Connection readiness is distinct from actual file-change events.
+        seen, lock = set(), threading.Lock()
+        def ready(library=None):
+            with lock:
+                reconnect = library in seen
+                seen.add(library)
+            setting = "scan_on_reconnect" if reconnect else "scan_on_startup"
+            if not self.config["sync"][setting]:
+                self.state.log("INFO",f"{library or 'CloudDrive'} 通知已就绪；按 {setting}=false 跳过全量补扫")
+                return
+            if library is None:
+                self.reconnected()
+            else:
+                self.schedule(library)
+        return ready
 
     def start(self):
         self.state.log("INFO","服务启动；等待源目录标记和 CloudDrive 配置")
@@ -226,15 +246,17 @@ class Service:
             with self.queue_lock:
                 self.pending.clear()
             self.monitor = self.new_monitor()
-            self.native = Monitor(self.config,self.schedule,self.state.log)
+            self.native = self.new_native()
             self.monitor.start()
             self.native.start()
             self.discover()
-            self.reconnected()
+            if self.config["sync"]["scan_on_startup"]:
+                self.reconnected()
             self.state.log("INFO","配置已保存并应用；Web 监听地址或端口变化需重启")
 
     def run(self):
-        next_scan, next_transfer, next_discover = 0,0,0
+        next_scan = 0 if self.config["sync"]["scan_on_startup"] else time.monotonic()+self.config["sync"]["interval_seconds"]
+        next_transfer, next_discover = 0,0
         while not self.stop_event.is_set():
             try:
                 with self.lock:

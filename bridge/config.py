@@ -12,6 +12,7 @@ DEFAULT = {
     "cloud": {"enabled": False, "url": "http://127.0.0.1:19798", "token": "",
               "username": "", "password": "", "reconnect_seconds": 10},
     "sync": {"interval_seconds": 900, "debounce_seconds": 3, "settle_seconds": 15,
+             "scan_on_startup": True, "scan_on_reconnect": True,
              "scan_workers": 4, "file_workers": 4,
              "cleanup_enabled": False, "watch_mode": "auto", "watch_poll_seconds": 30,
              "metadata_verify_seconds": 3600,
@@ -120,6 +121,9 @@ def validate(c, data_dir=None):
         raise ValueError("allow_empty_cleanup 必须是布尔值")
     if type(c["sync"]["cleanup_enabled"]) is not bool:
         raise ValueError("cleanup_enabled 必须是布尔值")
+    for key in ("scan_on_startup", "scan_on_reconnect"):
+        if type(c["sync"][key]) is not bool:
+            raise ValueError(f"{key} 必须是布尔值")
     if c["sync"]["watch_mode"] not in ("auto", "poll", "off"):
         raise ValueError("watch_mode 仅支持 auto/poll/off")
     excludes=c["sync"]["exclude_directories"]
@@ -210,7 +214,7 @@ def load(path):
     config = json.loads(path.read_text(encoding="utf-8-sig"))
     # Only migrate fields introduced by this version; unknown fields still fail validation.
     for key in ("cleanup_enabled", "watch_mode", "watch_poll_seconds", "metadata_verify_seconds",
-                "scan_workers", "file_workers"):
+                "scan_workers", "file_workers", "scan_on_startup", "scan_on_reconnect"):
         config.get("sync", {}).setdefault(key, DEFAULT["sync"][key])
     for lib in config.get("libraries", []):
         lib.setdefault("mount_root", ""); lib.setdefault("output_mount_root", "")

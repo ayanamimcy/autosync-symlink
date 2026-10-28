@@ -122,7 +122,7 @@ class CloudMonitor:
 
     def connected(self):
         self.status = "已连接，等待文件事件"
-        self.log("INFO","CloudDrive 文件推送已连接；正在安排断线补扫")
+        self.log("INFO","CloudDrive 文件推送已连接；按配置决定是否安排全量补扫")
         self.on_reconnect()
 
     def run(self):

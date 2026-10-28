@@ -18,8 +18,9 @@ def event_scope(relative):
 
 
 class PollingWatch:
-    def __init__(self, library, callback, log, seconds, excludes):
+    def __init__(self, library, callback, log, seconds, excludes, ready=None):
         self.library, self.callback, self.log = library, callback, log
+        self.ready = ready if ready is not None else lambda lib: callback(lib, "")
         self.seconds, self.excludes = seconds, excludes
         self.stop_event = threading.Event(); self.ready_event = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True, name="poll-"+library["id"])
@@ -33,7 +34,7 @@ class PollingWatch:
     def once(self):
         current = self.snapshot()
         if self.previous is None:
-            self.callback(self.library["id"], "")
+            self.ready(self.library["id"])
         else:
             scopes = {event_scope(p) for p in current.keys() | self.previous.keys()
                       if current.get(p) != self.previous.get(p)}
@@ -61,23 +62,23 @@ class PollingWatch:
 
 
 class Monitor:
-    def __init__(self, config, callback, log):
+    def __init__(self, config, callback, log, ready=None):
         self.impl = None; self.watchers = []; self.kind = "目录监控关闭；使用定期对账"
         mode = config["sync"]["watch_mode"]
         if mode == "off":
             return
         if mode == "auto" and os.name == "nt":
             from .native_watch import NativeMonitor
-            self.impl = NativeMonitor(config["libraries"], callback, log)
+            self.impl = NativeMonitor(config["libraries"], callback, log, ready=ready)
             return
         if mode == "auto" and sys.platform == "linux":
             from .linux_watch import InotifyWatch
             self.kind = "Linux inotify"
-            factory = lambda lib: InotifyWatch(lib, callback, log, config["sync"]["exclude_directories"])
+            factory = lambda lib: InotifyWatch(lib, callback, log, config["sync"]["exclude_directories"], ready=ready)
         else:
             self.kind = "目录轮询（非云端实时保证）"
             factory = lambda lib: PollingWatch(lib, callback, log, config["sync"]["watch_poll_seconds"],
-                                             config["sync"]["exclude_directories"])
+                                             config["sync"]["exclude_directories"], ready=ready)
         self.watchers = [factory(lib) for lib in config["libraries"] if lib["enabled"]]
 
     def start(self):

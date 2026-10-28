@@ -29,8 +29,9 @@ def parse_notifications(data):
 
 
 class DirectoryWatch:
-    def __init__(self, library, callback, log):
+    def __init__(self, library, callback, log, ready=None):
         self.library, self.callback, self.log = library, callback, log
+        self.ready = ready if ready is not None else lambda lib: callback(lib, "")
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
         self.status = "等待订阅"
@@ -98,7 +99,7 @@ class DirectoryWatch:
                     self.status = "已订阅"
                     self.ready_event.set()
                     self.log("INFO",f"{self.library['id']} Windows 目录通知已订阅")
-                    self.callback(self.library["id"],"")
+                    self.ready(self.library["id"])
                     first = False
                 while True:
                     wait = k.WaitForSingleObject(event,500)
@@ -133,8 +134,8 @@ class DirectoryWatch:
 
 
 class NativeMonitor:
-    def __init__(self, libraries, callback, log):
-        self.watchers = [DirectoryWatch(lib,callback,log) for lib in libraries if lib["enabled"]] if os.name=="nt" else []
+    def __init__(self, libraries, callback, log, ready=None):
+        self.watchers = [DirectoryWatch(lib,callback,log,ready=ready) for lib in libraries if lib["enabled"]] if os.name=="nt" else []
 
     def start(self):
         for w in self.watchers:

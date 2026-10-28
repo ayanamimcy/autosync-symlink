@@ -33,8 +33,9 @@ def records(data):
 
 
 class InotifyWatch:
-    def __init__(self, library, callback, log, excludes=()):
+    def __init__(self, library, callback, log, excludes=(), ready=None):
         self.library, self.callback, self.log = library, callback, log
+        self.ready = ready if ready is not None else lambda lib: callback(lib, "")
         self.root = Path(library["source"])
         self.excludes = {x.casefold() for x in excludes}
         self.stop_event = threading.Event(); self.ready_event = threading.Event()
@@ -104,7 +105,7 @@ class InotifyWatch:
             self.directories.clear()
             self.add_tree(self.root)
             self.ready_event.set()
-            self.callback(self.library["id"], "")
+            self.ready(self.library["id"])
             while not self.stop_event.is_set():
                 readable, _, _ = select.select([self.fd], [], [], 0.5)
                 if identity != identities(self.library):

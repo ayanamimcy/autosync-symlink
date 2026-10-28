@@ -44,6 +44,8 @@ CloudDrive 若在容器中挂载，把专用父目录配置为宿主 shared 挂�
 
 Plex 的一个通知配置只对应一个 `section_id`。电影、电视剧和番剧若是三个 Section，应创建三条配置，每条只绑定对应的媒体库 ID，不能把三类通知都发给同一个 Section。
 
+云盘被限流时，先保持同步服务停止。需要在后续启动时跳过全量，可在更新到支持该功能的版本后，将 `sync.scan_on_startup` 和 `sync.scan_on_reconnect` 设为 `false`，将 `sync.interval_seconds` 设为 `43200`。若同时要求避免本地监听初始化的目录遍历，将 `sync.watch_mode` 设为 `off`，使用已验证的 CloudDrive gRPC 文件通知；未接通通知时仅保留定时/手动同步。完整配置片段及行为边界见 README「跳过启动全量扫描」。
+
 ## 镜像和 Stack
 
 GitHub Actions 测试通过后自动发布 AMD64/ARM64 镜像。在本地 Debian 目标机器拉取：

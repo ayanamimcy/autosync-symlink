@@ -24,9 +24,12 @@ function renderConfig(){
  $('#cloud-url').value=cfg.cloud.url;$('#cloud-token').value=cfg.cloud.token;$('#cloud-enabled').checked=cfg.cloud.enabled;
  $('#config-json').value=JSON.stringify(cfg,null,2);
  $('#sync-config').replaceChildren();
- for(const [key,label] of [['scan_workers','目录扫描线程数'],['file_workers','文件处理线程数']]){
-  const f=field(label,cfg.sync[key],'number');f.input.min='1';f.input.max='32';f.input.step='1';f.input.required=true;
+ for(const [key,label,min,max] of [['interval_seconds','定时全量扫描间隔（秒）',10,86400],['scan_workers','目录扫描线程数',1,32],['file_workers','文件处理线程数',1,32]]){
+  const f=field(label,cfg.sync[key],'number');f.input.min=String(min);f.input.max=String(max);f.input.step='1';f.input.required=true;
   f.input.addEventListener('input',()=>{cfg.sync[key]=Number(f.input.value);});$('#sync-config').append(f.label);
+ }
+ for(const [key,label] of [['scan_on_startup','启动或应用配置后全量扫描'],['scan_on_reconnect','文件通知重连后全量补扫']]){
+  const f=field(label,cfg.sync[key],'checkbox');f.input.addEventListener('input',()=>{cfg.sync[key]=f.input.checked;});$('#sync-config').append(f.label);
  }
  $('#library-config').replaceChildren();$('#server-config').replaceChildren();
  for(const lib of cfg.libraries){const p=el('article','panel'),grid=el('div','form-grid');p.append(el('h3','',lib.name+' / '+lib.id));
