@@ -1,8 +1,6 @@
 services:
   arr-import:
-    build:
-      context: ..
-    image: autosync-symlink:arr-import
+    image: ${ARR_IMPORT_IMAGE:-ghcr.io/ayanamimcy/autosync-symlink:edge}
     entrypoint: ["python", "-m", "bridge.arr_import"]
     command: ["--config", "/settings/arr-import.json", "--data-dir", "/data"]
     user: "${PUID:-1000}:${PGID:-1000}"

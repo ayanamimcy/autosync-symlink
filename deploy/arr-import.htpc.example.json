@@ -1,0 +1,74 @@
+{
+  "enabled": false,
+  "host": "0.0.0.0",
+  "port": 8096,
+  "token": "${ARR_IMPORT_TOKEN}",
+  "cloud": {
+    "url": "http://host.docker.internal:19798",
+    "token": "${CD2_IMPORT_TOKEN}"
+  },
+  "account_root": "/115open",
+  "staging_root": "/115open/.arr-import",
+  "poll_seconds": 5,
+  "settle_seconds": 20,
+  "timeout_seconds": 7200,
+  "max_errors": 12,
+  "rules": [
+    {
+      "id": "radarr-downloads",
+      "app": "radarr",
+      "mode": "cd2",
+      "enabled": true,
+      "source_root": "/downloads",
+      "destination_root": "/movies",
+      "cloud_source_root": "/115open/pt/download",
+      "cloud_destination_root": "/115open/pt/movie"
+    },
+    {
+      "id": "sonarr-downloads",
+      "app": "sonarr",
+      "mode": "cd2",
+      "enabled": true,
+      "source_root": "/downloads",
+      "destination_root": "/tv",
+      "cloud_source_root": "/115open/pt/download",
+      "cloud_destination_root": "/115open/pt/tv"
+    },
+    {
+      "id": "radarr-cloud-downloads",
+      "app": "radarr",
+      "mode": "cd2",
+      "enabled": true,
+      "source_root": "/cloud_downloads",
+      "destination_root": "/movies",
+      "cloud_source_root": "/115open/CloudDownload",
+      "cloud_destination_root": "/115open/pt/movie"
+    },
+    {
+      "id": "sonarr-cloud-downloads",
+      "app": "sonarr",
+      "mode": "cd2",
+      "enabled": true,
+      "source_root": "/cloud_downloads",
+      "destination_root": "/tv",
+      "cloud_source_root": "/115open/CloudDownload",
+      "cloud_destination_root": "/115open/pt/tv"
+    },
+    {
+      "id": "radarr-local",
+      "app": "radarr",
+      "mode": "native",
+      "enabled": true,
+      "source_root": "/local",
+      "destination_root": "/movies"
+    },
+    {
+      "id": "sonarr-local",
+      "app": "sonarr",
+      "mode": "native",
+      "enabled": true,
+      "source_root": "/local",
+      "destination_root": "/tv"
+    }
+  ]
+}

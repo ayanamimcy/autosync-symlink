@@ -26,6 +26,7 @@
 | `rules[].source_root / destination_root` | **Arr 容器内**的下载目录与媒体根目录 |
 | `rules[].cloud_source_root / cloud_destination_root` | 上述目录对应的 **CD2 API 虚拟路径** |
 | `rules[].enabled` | 分别启停 Radarr、Sonarr 或其他不歧义的路径规则 |
+| `rules[].mode` | 默认 `cd2`；显式 `native` 规则只返回原生导入，不需要云端路径字段 |
 | `settle_seconds` | 远程身份/上传状态通过后的稳定等待时间 |
 | `timeout_seconds` | 单任务等待上传与整理的总期限，默认两小时 |
 | `max_errors` | 连续 API 异常次数上限，达到后停止并等待显式重试 |
@@ -63,7 +64,7 @@ python3 -m bridge.arr_import --config /path/to/arr-import.json --data-dir /path/
 
 ## Docker 部署
 
-使用 [独立 Compose](../deploy/arr-import.compose.yaml)，它从当前源码构建，单独运行整理服务。准备权限为 600 的环境文件：
+使用 [独立 Compose](../deploy/arr-import.compose.yaml)，默认拉取 GitHub Actions 发布的镜像，单独运行整理服务，不在部署主机 build。准备权限为 600 的环境文件：
 
 ```dotenv
 ARR_IMPORT_TOKEN=替换为独立随机密钥
@@ -79,10 +80,15 @@ PGID=1000
 
 ```sh
 docker compose --env-file /path/to/arr-import.env -f deploy/arr-import.compose.yaml config --quiet
-docker compose --env-file /path/to/arr-import.env -f deploy/arr-import.compose.yaml up -d --build
+docker compose --env-file /path/to/arr-import.env -f deploy/arr-import.compose.yaml pull
+docker compose --env-file /path/to/arr-import.env -f deploy/arr-import.compose.yaml up -d
 ```
 
 Linux 示例用 `host.docker.internal:host-gateway` 访问原生 CD2。CD2 必须监听容器可达的宿主地址；只监听宿主回环不一定可达。沿用并验证 qB/Arr 已有的 FUSE 权限、挂载传播和 CD2 重启后的挂载可见性。整理容器不需要 FUSE、privileged 或 Docker socket。
+
+使用 `${CONFIGS}=/srv/htpc`、`/downloads`、`/movies`、`/tv` 的已有 HTPC Stack，可直接使用 [HTPC 配套说明](ARR_IMPORT_HTPC.md) 与 overlay，无需创建外部 Docker 网络。
+
+需要本地源码构建时，可先执行 `docker build -t autosync-symlink:arr-import .`，再设置 `ARR_IMPORT_IMAGE=autosync-symlink:arr-import`。生产使用可将该变量固定到 Actions 成功发布的 `sha-<完整提交 SHA>`。
 
 ## 安装 Arr 导入脚本
 

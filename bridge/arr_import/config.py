@@ -61,11 +61,18 @@ def load(path):
             raise ValueError("规则 id 必须唯一，app 为 radarr/sonarr，enabled 为布尔值")
         ids.add(r["id"])
         for key in ("source_root", "destination_root", "cloud_source_root", "cloud_destination_root"):
-            remote_path(r[key])
+            if key in ("source_root", "destination_root") or r.get("mode", "cd2") == "cd2":
+                remote_path(r[key])
+        if r.get("mode", "cd2") not in ("cd2", "native"):
+            raise ValueError("规则 mode 仅支持 cd2/native")
+        if overlap(r["source_root"], r["destination_root"]):
+            raise ValueError("下载暂存目录与媒体目录不能重叠")
+        if r.get("mode") == "native":
+            continue
         for key in ("cloud_source_root", "cloud_destination_root"):
             if r[key] == account or not inside(r[key], account) or overlap(r[key], stage):
                 raise ValueError("云端路径需位于同一账号内，且不能与暂存目录重叠")
-        if overlap(r["source_root"], r["destination_root"]) or overlap(r["cloud_source_root"], r["cloud_destination_root"]):
+        if overlap(r["cloud_source_root"], r["cloud_destination_root"]):
             raise ValueError("下载暂存目录与媒体目录不能重叠")
     for i, a in enumerate(c["rules"]):
         for b in c["rules"][i+1:]:
@@ -85,6 +92,8 @@ def route(c, request):
     if len(matches) != 1:
         raise ValueError("源和目标必须精确匹配一条已配置规则；不自动回退文件复制")
     r = matches[0]
+    if r.get("mode") == "native":
+        return {"rule": r["id"], "source": source, "destination": destination, "native": True}
     cloud_source = r["cloud_source_root"] + source[len(r["source_root"]):]
     cloud_destination = r["cloud_destination_root"] + destination[len(r["destination_root"]):]
     if cloud_source == cloud_destination:

@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from bridge.arr_import.cloud import Cloud, OperationRejected, file_info, number
-from bridge.arr_import.config import load
+from bridge.arr_import.config import load, route
 from bridge.arr_import.service import Importer, Server, Store
 from bridge.protocol import frame, text_field
 from scripts import arr_import as hook
@@ -188,6 +188,13 @@ class ImportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.imp.submit({**self.request, "mtime_ns": 1235})
 
+    def test_explicit_local_native_rule_does_not_require_cloud_paths(self):
+        self.cfg["rules"].append({"id": "local", "app": "radarr", "mode": "native", "enabled": True,
+                                  "source_root": "/local", "destination_root": "/cloud/movies"})
+        self.assertEqual(self.imp.submit({**self.request, "source": "/local/a.mkv"}), {"status": "native"})
+        self.assertEqual(self.store.active(), [])
+        self.assertEqual(self.cloud.calls, [])
+
     def test_disabling_rule_does_not_send_existing_jobs_to_native_import(self):
         self.submit()
         self.cfg["rules"][0]["enabled"] = False
@@ -330,6 +337,31 @@ class WireTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_htpc_paths_and_explicit_native_rules(self):
+        example = Path(__file__).resolve().parents[1] / "deploy/arr-import.htpc.example.json"
+        c = json.loads(example.read_text())
+        c.update(enabled=True, token="validation-service-secret-123456")
+        c["cloud"]["token"] = "validation-cloud-secret"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.json"
+            path.write_text(json.dumps(c))
+            loaded = load(path)
+        for app, destination, cloud_dest in (("radarr", "/movies/a.mkv", "/115open/pt/movie/a.mkv"),
+                                              ("sonarr", "/tv/a.mkv", "/115open/pt/tv/a.mkv")):
+            for source, cloud_source in (("/downloads/a.mkv", "/115open/pt/download/a.mkv"),
+                                        ("/cloud_downloads/a.mkv", "/115open/CloudDownload/a.mkv")):
+                result = route(loaded, {"app": app, "source": source, "destination": destination})
+                self.assertEqual(result["source"], cloud_source)
+                self.assertEqual(result["destination"], cloud_dest)
+                self.assertFalse(result["native"])
+            self.assertTrue(route(loaded, {"app": app, "source": "/local/a.mkv", "destination": destination})["native"])
+        loaded["rules"][-1]["mode"] = "typo"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.json"
+            path.write_text(json.dumps(loaded))
+            with self.assertRaises(ValueError):
+                load(path)
+
     def test_account_boundary_and_staging_validation(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "config.json"
