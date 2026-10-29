@@ -24,7 +24,10 @@ function renderConfig(){
  $('#cloud-url').value=cfg.cloud.url;$('#cloud-token').value=cfg.cloud.token;$('#cloud-enabled').checked=cfg.cloud.enabled;
  $('#config-json').value=JSON.stringify(cfg,null,2);
  $('#sync-config').replaceChildren();
- for(const [key,label,min,max] of [['interval_seconds','定时全量扫描间隔（秒）',10,86400],['scan_workers','目录扫描线程数',1,32],['file_workers','文件处理线程数',1,32]]){
+ const backendLabel=el('label','','扫描数据来源'),backend=el('select');
+ for(const [value,label] of [['filesystem','挂载盘目录遍历'],['clouddrive','CloudDrive2 API']]){const option=el('option','',label);option.value=value;backend.append(option);}
+ backend.value=cfg.sync.scan_backend;backend.addEventListener('change',()=>{cfg.sync.scan_backend=backend.value;});backendLabel.append(backend);$('#sync-config').append(backendLabel);
+ for(const [key,label,min,max] of [['interval_seconds','定时全量扫描间隔（秒）',10,86400],['scan_workers','挂载盘目录扫描线程数',1,32],['cloud_list_workers','CD2 API 目录并发数',1,4],['cloud_list_interval_ms','CD2 API 请求最小间隔（毫秒）',100,60000],['file_workers','文件处理线程数',1,32]]){
   const f=field(label,cfg.sync[key],'number');f.input.min=String(min);f.input.max=String(max);f.input.step='1';f.input.required=true;
   f.input.addEventListener('input',()=>{cfg.sync[key]=Number(f.input.value);});$('#sync-config').append(f.label);
  }

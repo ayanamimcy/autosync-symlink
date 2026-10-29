@@ -35,7 +35,10 @@
     "scan_workers": 4,
     "file_workers": 4,
     "scan_on_startup": true,
-    "scan_on_reconnect": true
+    "scan_on_reconnect": true,
+    "scan_backend": "filesystem",
+    "cloud_list_workers": 2,
+    "cloud_list_interval_ms": 500
   },
   "libraries": [
     {

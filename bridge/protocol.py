@@ -1,6 +1,6 @@
 """Small, bounded protobuf/gRPC-Web codec. Schema facts: see REFERENCES.md.
 
-Only CloudDrive GetToken, GetSystemInfo and PushMessage are used. Unknown
+CloudDrive method/field mappings are documented in REFERENCES.md. Unknown
 protobuf fields are skipped, compressed gRPC frames fail explicitly.
 """
 import struct

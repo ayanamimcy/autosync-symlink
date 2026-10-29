@@ -24,4 +24,6 @@ Arr 脚本接收 sourcePath / destinationFilePath 两个参数，以及 Radarr_S
 
 CloudDrive 服务为 clouddrive.CloudDriveFileSrv，端点 GetToken / GetSystemInfo / GetMountPoints / PushMessage。使用 application/grpc-web+proto 和 Authorization: Bearer。PushMessage.type=4 表示文件变化；payload 字段 5 为 FileSystemChange，其字段 1/2/3/4 分别为变化类型、目录标志、旧路径、新路径。GetMountPointsResult 字段 1 包含重复的挂载点；挂载点字段 1/2/9 分别为挂载路径、虚拟源目录、是否已挂载。客户端对未知字段跳过，对压缩帧、超长帧和非零 gRPC 状态明确报错。
 
+主扫描后端另外使用 `GetSubFiles(ListSubFileRequest) returns (stream SubFilesReply)`：请求字段 1 为 path、2 为 forceRefresh；不设置可选字段 3 checkExpires，沿用服务端策略。普通枚举显式 forceRefresh=false，清理缺失校验才使用 true。SubFilesReply 字段 1 为重复 CloudDriveFile，文件字段 2/3/4/5/7/30/36 分别为名称、完整虚拟路径、大小、类型（0 目录 / 1 文件 / 2 其他）、修改时间 Timestamp、目录标志、禁止访问标志。Timestamp 使用 seconds 字段 1 与 nanos 字段 2，保留纳秒。独立 Arr 模块继续使用其自身的强制刷新策略，不受扫描后端开关影响。
+
 Plex 使用 GET /library/sections/{id}/refresh?path=... 和 X-Plex-Token。Emby/Jellyfin 使用 POST /Library/Media/Updated，数据为 Updates 数组，元素包含 Path 和 UpdateType。Jellyfin 使用 Authorization: MediaBrowser Token="..."；Emby 使用 X-Emby-Token。具体服务器版本、挂载点可见性和实际推送订阅仍需在目标机验收。

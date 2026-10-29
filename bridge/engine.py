@@ -12,17 +12,19 @@ import uuid
 from .paths import file_hash, is_link, no_link_ancestors, safe_join, walk
 from .mounts import identities, assert_unchanged
 from .parallel import bounded_map
+from .cloud_scan import CloudScanner
 
 VIDEOS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg", ".webm", ".iso", ".rmvb"}
 METADATA = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".xml"}
 
 
 class Engine:
-    def __init__(self, state, config, progress=None, scan_progress=None):
+    def __init__(self, state, config, progress=None, scan_progress=None, cloud_paths=None):
         self.state, self.config = state, config
         self.progress = progress or (lambda *_:None)
         self.directory_lock = threading.Lock()
         self.scan_progress = scan_progress
+        self.cloud_paths = cloud_paths or {}
 
     def health(self, lib):
         identities(lib)
@@ -131,6 +133,9 @@ class Engine:
                 with temp.open("xb") as f:
                     f.write(payload); f.flush(); os.fsync(f.fileno())
             else:
+                # API inventory does not walk mounted ancestors. Before reading
+                # metadata, retain the source symlink/junction protection.
+                no_link_ancestors(p)
                 with p.open("rb") as f:
                     payload = f.read(self.config["sync"]["metadata_max_mb"]*1024*1024+1)
                 if len(payload) > self.config["sync"]["metadata_max_mb"]*1024*1024:
@@ -185,28 +190,31 @@ class Engine:
         if scope and any(part.casefold() in {x.casefold() for x in excluded} for part in Path(scope).parts):
             return {"library":lib["id"],"scope":scope,"seen":0,"changes":[],"change_count":0,
                     "deferred":0,"scan_complete":True,"errors":[],"dry_run":dry_run,"skipped":True}
-        if scope:
-            base = safe_join(source,scope)
-        else:
-            base = source
         # Missing scoped directory is valid only after checking the full source health.
         listing_errors = []
-        try:
-            mode = base.stat().st_mode
-        except FileNotFoundError:
-            files = []
+        def reading(stage, path):
+            self.progress(stage, path)
+            report(stage=stage, path=path)
+        scanner, files = None, []
+        backend = self.config["sync"]["scan_backend"]
+        if backend == "clouddrive":
+            scanner = CloudScanner(self.config, lib, reading, self.cloud_paths.get(lib["id"]))
+            inventory = scanner.walk(scope)
         else:
-            if not stat.S_ISDIR(mode):
-                raise OSError("扫描范围不再是目录，已停止处理")
-            def reading(stage, path):
-                self.progress(stage, path)
-                report(stage=stage, path=path)
-            files = []
-            for item in walk(base,errors=listing_errors,progress=reading,exclude_dirs=excluded,
-                             workers=self.config["sync"]["scan_workers"]):
-                files.append(item)
-                if item[0].suffix.lower() in VIDEOS | METADATA:
-                    report(increments={"seen":1}, path=str(item[0]))
+            base = safe_join(source,scope) if scope else source
+            try:
+                mode = base.stat().st_mode
+            except FileNotFoundError:
+                inventory = iter(())
+            else:
+                if not stat.S_ISDIR(mode):
+                    raise OSError("扫描范围不再是目录，已停止处理")
+                inventory = walk(base,errors=listing_errors,progress=reading,exclude_dirs=excluded,
+                                 workers=self.config["sync"]["scan_workers"])
+        for item in inventory:
+            files.append(item)
+            if item[0].suffix.lower() in VIDEOS | METADATA:
+                report(increments={"seen":1}, path=str(item[0]))
         files.sort(key=lambda item: item[0].as_posix())
         assert_unchanged(lib, mount_ids)
         report(stage="校验输出计划", errors=len(listing_errors))
@@ -270,8 +278,23 @@ class Engine:
         if cleanup and not listing_errors:
             assert_unchanged(lib, mount_ids)
             self.health(lib)
-            eligible = [r for r in rows.values() if not scope or r["rel"].startswith(scope.rstrip("/")+"/")]
+            excluded_names = {x.casefold() for x in excluded}
+            eligible = [r for r in rows.values()
+                        if (not scope or r["rel"].startswith(scope.rstrip("/")+"/"))
+                        and not any(part.casefold() in excluded_names for part in PurePosixPath(r["rel"]).parts[:-1])]
             missing = [r for r in eligible if r["rel"] not in seen]
+            if scanner and missing:
+                # Cached absence alone is not authority to delete. Collect all
+                # fresh confirmations before changing any missing_since value.
+                confirmed = scanner.confirm_missing([r["rel"] for r in missing])
+                revived = [r for r in missing if r["rel"] not in confirmed]
+                for row in revived:
+                    seen.add(row["rel"])
+                    if not dry_run and row["missing_since"] is not None:
+                        self.state.execute("UPDATE files SET missing_since=NULL WHERE library=? AND rel=?", (lib["id"],row["rel"]))
+                # Fresh data may contain updates absent from the cached plan.
+                deferred += len(revived)
+                missing = [r for r in missing if r["rel"] in confirmed]
             # Cleanup never treats an inaccessible/empty mount as authoritative.
             if missing and not seen and not self.config["sync"]["allow_empty_cleanup"]:
                 errors.append("空快照保护：本次不删除任何托管文件")
@@ -299,11 +322,12 @@ class Engine:
                     self.prune(output)
         result = {"library":lib["id"],"scope":scope,"seen":len(seen),"changes":changes[:500],
                   "change_count":len(changes),"elapsed_seconds":round(time.monotonic()-started,3),
+                  "scan_backend":backend,
                   "deferred":deferred,"scan_complete":not listing_errors,"errors":errors[:100],"dry_run":dry_run}
         report(stage="扫描结束", seen=len(seen), changes=len(changes), errors=len(errors))
         if not dry_run:
             self.state.log("WARN" if errors else "INFO",f"{lib['name']}: 扫描 {len(seen)}，变更 {len(changes)}，问题 {len(errors)}，耗时 {result['elapsed_seconds']} 秒"
-                           f"（目录 {self.config['sync']['scan_workers']} / 文件 {self.config['sync']['file_workers']} 线程）" + ("；"+"；".join(errors[:3]) if errors else ""))
+                           f"（{'CD2 API' if scanner else '挂载盘'}；目录 {self.config['sync']['cloud_list_workers'] if scanner else self.config['sync']['scan_workers']} / 文件 {self.config['sync']['file_workers']} 线程）" + ("；"+"；".join(errors[:3]) if errors else ""))
         return result
 
     def prune(self, root):

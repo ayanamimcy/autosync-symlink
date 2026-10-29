@@ -13,6 +13,7 @@ DEFAULT = {
               "username": "", "password": "", "reconnect_seconds": 10},
     "sync": {"interval_seconds": 900, "debounce_seconds": 3, "settle_seconds": 15,
              "scan_on_startup": True, "scan_on_reconnect": True,
+             "scan_backend": "filesystem", "cloud_list_workers": 2, "cloud_list_interval_ms": 500,
              "scan_workers": 4, "file_workers": 4,
              "cleanup_enabled": False, "watch_mode": "auto", "watch_poll_seconds": 30,
              "metadata_verify_seconds": 3600,
@@ -112,7 +113,8 @@ def validate(c, data_dir=None):
                             ("settle_seconds", 0, 3600), ("delete_grace_seconds", 0, 604800),
                             ("metadata_max_mb", 1, 256), ("watch_poll_seconds", 1, 86400),
                             ("metadata_verify_seconds", 0, 604800),
-                            ("scan_workers", 1, 32), ("file_workers", 1, 32)]:
+                            ("scan_workers", 1, 32), ("file_workers", 1, 32),
+                            ("cloud_list_workers", 1, 4), ("cloud_list_interval_ms", 100, 60000)]:
         if not integer(c["sync"][key], low, high):
             raise ValueError(f"{key} 必须是 {low}–{high} 之间的整数")
     if type(c["sync"]["max_delete_fraction"]) not in (int, float) or not 0 < c["sync"]["max_delete_fraction"] <= 1:
@@ -126,6 +128,8 @@ def validate(c, data_dir=None):
             raise ValueError(f"{key} 必须是布尔值")
     if c["sync"]["watch_mode"] not in ("auto", "poll", "off"):
         raise ValueError("watch_mode 仅支持 auto/poll/off")
+    if c["sync"]["scan_backend"] not in ("filesystem", "clouddrive"):
+        raise ValueError("scan_backend 仅支持 filesystem/clouddrive")
     excludes=c["sync"]["exclude_directories"]
     if not isinstance(excludes,list) or any(not isinstance(x,str) or not x or x in (".","..") or any(y in x for y in "/\\:") for x in excludes):
         raise ValueError("exclude_directories 应为需要跳过的单个目录名列表")
@@ -214,7 +218,8 @@ def load(path):
     config = json.loads(path.read_text(encoding="utf-8-sig"))
     # Only migrate fields introduced by this version; unknown fields still fail validation.
     for key in ("cleanup_enabled", "watch_mode", "watch_poll_seconds", "metadata_verify_seconds",
-                "scan_workers", "file_workers", "scan_on_startup", "scan_on_reconnect"):
+                "scan_workers", "file_workers", "scan_on_startup", "scan_on_reconnect",
+                "scan_backend", "cloud_list_workers", "cloud_list_interval_ms"):
         config.get("sync", {}).setdefault(key, DEFAULT["sync"][key])
     for lib in config.get("libraries", []):
         lib.setdefault("mount_root", ""); lib.setdefault("output_mount_root", "")

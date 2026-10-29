@@ -189,7 +189,8 @@ class Service:
                     self.state.update_scan_progress(scan_id, snapshot)
                     last_checkpoint, last_stage = now, snapshot["stage"]
             engine = Engine(self.state, self.config, self.progress,
-                            scan_progress=update_progress if scan_id is not None else None)
+                            scan_progress=update_progress if scan_id is not None else None,
+                            cloud_paths=self.cloud_paths)
             try:
                 result = engine.scan(lib,scope=scope,cleanup=cleanup,dry_run=action=="preview")
             except Exception as e:

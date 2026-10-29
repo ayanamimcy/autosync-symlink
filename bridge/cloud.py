@@ -1,8 +1,56 @@
 import http.client
+import posixpath
 import threading
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 from .config import secret
-from .protocol import decode_change, fields, frame, messages, text_field
+from .protocol import decode_change, fields, frame, messages, text_field, varint
+
+
+@dataclass(frozen=True)
+class CloudFile:
+    name: str
+    path: str
+    directory: bool
+    size: int
+    mtime_ns: int
+    other: bool = False
+
+
+def virtual_path(path):
+    if (not isinstance(path, str) or not path.startswith("/") or "\\" in path
+            or "\x00" in path or any(p in (".", "..") for p in path.split("/"))):
+        raise ValueError("CloudDrive 虚拟路径无效")
+    path = path.rstrip("/") or "/"
+    if path != posixpath.normpath(path) or path.startswith("//"):
+        raise ValueError("CloudDrive 虚拟路径必须使用规范的绝对路径")
+    return path
+
+
+def cloud_file(payload, parent):
+    f = dict(fields(payload))
+    name, path = f.get(2, b"").decode("utf-8"), f.get(3, b"").decode("utf-8")
+    if (not name or name in (".", "..") or any(c in name for c in "/\\\x00")
+            or path != virtual_path(path) or path != posixpath.join(parent, name)):
+        raise ValueError("CloudDrive 返回的子文件路径越界或名称不匹配")
+    if f.get(36):
+        raise PermissionError("CloudDrive 目录包含无权访问的项目")
+    kind = f.get(5, 0)
+    if kind not in (0, 1, 2):
+        raise ValueError("CloudDrive 返回未知文件类型")
+    directory = kind != 2 and (kind == 0 or bool(f.get(30)))
+    size = f.get(4, 0)
+    if not isinstance(size, int) or not 0 <= size < (1 << 63):
+        raise ValueError("CloudDrive 文件大小无效")
+    stamp = dict(fields(f.get(7, b"")))
+    seconds, nanos = stamp.get(1, 0), stamp.get(2, 0)
+    if seconds >= 1 << 63:
+        seconds -= 1 << 64
+    if not (-62135596800 <= seconds <= 253402300799 and 0 <= nanos < 1000000000):
+        raise ValueError("CloudDrive 修改时间无效")
+    if kind != 2 and not directory and 7 not in f:
+        raise ValueError("CloudDrive 文件缺少修改时间，无法安全判断更新")
+    return CloudFile(name, path, directory, size, seconds * 1000000000 + nanos, kind == 2)
 
 
 class CloudClient:
@@ -73,6 +121,26 @@ class CloudClient:
                         result.append({"mount":f.get(1,b"").decode("utf-8"),
                                        "source":f.get(2,b"").decode("utf-8"),
                                        "mounted":bool(f.get(9,1))})
+            return result
+        finally:
+            conn.close()
+
+    def list_files(self, path, token, force_refresh=False):
+        path = virtual_path(path)
+        data = text_field(1, path) + varint(2 << 3) + varint(int(force_refresh))
+        conn, resp = self.open("GetSubFiles", data, token=token)
+        try:
+            result, names = [], set()
+            # Do not expose partial directory replies before the success trailer.
+            for reply in messages(resp):
+                for number, value in fields(reply):
+                    if number != 1:
+                        continue
+                    entry = cloud_file(value, path)
+                    if entry.name in names:
+                        raise ValueError("CloudDrive 目录返回重复项目")
+                    names.add(entry.name)
+                    result.append(entry)
             return result
         finally:
             conn.close()
