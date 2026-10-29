@@ -1,0 +1,6 @@
+{
+  "url": "http://arr-import:8096",
+  "token": "${ARR_IMPORT_TOKEN}",
+  "timeout_seconds": 180,
+  "poll_seconds": 3
+}

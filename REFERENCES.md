@@ -1,5 +1,13 @@
 # 接口文档与协议约定
 
+独立 Arr 入库模块另外使用 GetSubFiles(forceRefresh=true)、GetUploadFileList(getAll=true)、CreateFolder、CopyFile、RenameFile、MoveFile。CopyFile/MoveFile 显式使用 conflictPolicy=Skip(2)，不使用默认 Overwrite(0)。CloudDriveFile 的 fileHashes 字段 70 为 map，Sha1 键为 2；上传 statusEnum 字段 8 的 Finish 为 5。代码只接受可核验的云端 ID、SHA1、大小及上传状态。
+
+- Radarr 导入脚本契约：https://github.com/Radarr/Radarr/blob/master/src/NzbDrone.Core/MediaFiles/ScriptImportDecider.cs
+- Sonarr 导入脚本契约：https://github.com/Sonarr/Sonarr/blob/main/src/NzbDrone.Core/MediaFiles/ScriptImportDecider.cs
+- CD2 调用方式参考：https://github.com/ayanamimcy/115-media-automation/blob/main/internal/provider/clouddrive/client.go
+
+Arr 脚本接收 sourcePath / destinationFilePath 两个参数，以及 Radarr_SourcePath、Radarr_DestinationPath 或 Sonarr_SourcePath、Sonarr_DestinationPath 环境变量。成功输出 [MoveStatus] MoveComplete；明确选择原生处理时输出 [MoveStatus] DeferMove；失败以非零退出码阻止原生文件传输。部署与实际验证边界见 docs/ARR_IMPORT.md。
+
 - CloudDrive2 官方开发者指南：https://www.clouddrive2.com/api/CloudDrive2_gRPC_API_Guide.html
 - CloudDrive2 官方 proto 下载：https://www.clouddrive2.com/api/clouddrive.proto
 - 官方媒体插件公开的协议字段定义：https://github.com/cloud-fs/clouddrive-mediaserver-plugin/blob/main/src/CloudDrive.MediaServer/Protocol/CloudDriveMessages.cs

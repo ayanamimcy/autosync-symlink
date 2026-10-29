@@ -1,0 +1,36 @@
+{
+  "enabled": false,
+  "host": "0.0.0.0",
+  "port": 8096,
+  "token": "${ARR_IMPORT_TOKEN}",
+  "cloud": {
+    "url": "http://host.docker.internal:19798",
+    "token": "${CD2_IMPORT_TOKEN}"
+  },
+  "account_root": "/115open",
+  "staging_root": "/115open/.arr-import",
+  "poll_seconds": 5,
+  "settle_seconds": 20,
+  "timeout_seconds": 7200,
+  "max_errors": 12,
+  "rules": [
+    {
+      "id": "radarr",
+      "app": "radarr",
+      "enabled": true,
+      "source_root": "/cloud/115/downloads",
+      "destination_root": "/cloud/115/media/movies",
+      "cloud_source_root": "/115open/downloads",
+      "cloud_destination_root": "/115open/media/movies"
+    },
+    {
+      "id": "sonarr",
+      "app": "sonarr",
+      "enabled": true,
+      "source_root": "/cloud/115/downloads",
+      "destination_root": "/cloud/115/media/tv",
+      "cloud_source_root": "/115open/downloads",
+      "cloud_destination_root": "/115open/media/tv"
+    }
+  ]
+}

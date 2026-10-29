@@ -1,0 +1,42 @@
+services:
+  arr-import:
+    build:
+      context: ..
+    image: autosync-symlink:arr-import
+    entrypoint: ["python", "-m", "bridge.arr_import"]
+    command: ["--config", "/settings/arr-import.json", "--data-dir", "/data"]
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      ARR_IMPORT_TOKEN: "${ARR_IMPORT_TOKEN:?需要设置整理服务密钥}"
+      CD2_IMPORT_TOKEN: "${CD2_IMPORT_TOKEN:?需要设置CD2令牌}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${ARR_IMPORT_BIND_IP:-127.0.0.1}:8096:8096"
+    volumes:
+      - type: bind
+        source: "${ARR_IMPORT_CONFIG_FILE:?需要指定服务配置文件绝对路径}"
+        target: /settings/arr-import.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${ARR_IMPORT_DATA_DIR:?需要指定持久化目录绝对路径}"
+        target: /data
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    stop_grace_period: 90s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8096/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+    networks: [arr]
+networks:
+  arr:
+    external: true
+    name: "${ARR_DOCKER_NETWORK:?需要指定Radarr和Sonarr所在的Docker网络}"
