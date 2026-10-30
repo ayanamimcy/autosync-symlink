@@ -31,6 +31,9 @@ def hook_config(path):
     if len(token) < 24:
         raise ValueError("hook token 至少需要 24 个字符")
     c["token"] = token
+    c.setdefault("transfer_mode", "auto")
+    if c["transfer_mode"] not in ("auto", "copy"):
+        raise ValueError("hook transfer_mode 只能是 auto 或 copy")
     for key, default, low, high in (("timeout_seconds", 180, 1, 86400), ("poll_seconds", 3, 1, 300)):
         c.setdefault(key, default)
         if type(c[key]) is not int or not low <= c[key] <= high:
@@ -79,7 +82,9 @@ def run_hook(c, source, destination, env=os.environ):
             or destination != import_env.get(prefix + "_destinationpath")):
         raise ValueError("脚本参数与 Arr 导入环境不一致")
     # Arr passes Move only when the download client no longer needs the file (no seeding).
-    mode = "move" if import_env.get(prefix + "_transfermode", "").lower() == "move" else "copy"
+    # transfer_mode "copy" in the hook config always keeps the source.
+    requested = import_env.get(prefix + "_transfermode", "").lower()
+    mode = "move" if requested == "move" and c.get("transfer_mode", "auto") == "auto" else "copy"
     try:
         size, modified = snapshot(source)
         payload = {"app": prefix, "source": source, "destination": destination, "transfer_mode": mode,

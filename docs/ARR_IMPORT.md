@@ -100,7 +100,7 @@ Linux 示例用 `host.docker.internal:host-gateway` 访问原生 CD2。CD2 必�
 
 hook 默认最多等待 180 秒，避免长期占用 Arr 导入流程；其超时后服务端任务仍保留。Arr 下次导入会复用相同任务，继续查询。只有远程核验成功、目标在 Arr 自己的挂载中可见（复制模式下还要源大小/mtime 未改变），才输出 `[MoveStatus] MoveComplete`。
 
-hook 读取 Arr 传入的 `TransferMode`：Arr 要求移动（Move，下载客户端不再需要这个文件，例如离线下载代理并打开了 Remove Completed）时，服务在云端移动源文件，不留副本；其余情况（Copy、HardLinkOrCopy）云端复制、保留源文件。移动后 hook 若超时重来，源文件已不在，hook 会按源和目标路径接上原任务。
+hook 读取 Arr 传入的 `TransferMode`：Arr 要求移动（Move，下载客户端不再需要这个文件，例如离线下载代理并打开了 Remove Completed）时，服务在云端移动源文件，不留副本；其余情况（Copy、HardLinkOrCopy）云端复制、保留源文件。移动后 hook 若超时重来，源文件已不在，hook 会按源和目标路径接上原任务。在 hook 配置里设 `"transfer_mode": "copy"`（默认 `auto`）可以一律复制：源文件在复制核验完成后才由下载端清理（例如离线下载代理的 `delete_files`）。
 
 ## 故障恢复
 

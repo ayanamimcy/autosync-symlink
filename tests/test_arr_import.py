@@ -389,6 +389,11 @@ class HookEnvironmentTests(unittest.TestCase):
         with patch.object(hook, "request", return_value={"id": "1" * 64, "status": "completed"}) as request:
             self.assertEqual(hook.run_hook(self.config, self.source, self.destination, env), "MoveComplete")
         self.assertTrue(request.call_args.args[2]["resume"])
+        Path(self.source).write_bytes(b"video")
+        with patch.object(hook, "request", return_value={"status": "native"}) as request:
+            hook.run_hook({**self.config, "transfer_mode": "copy"}, self.source, self.destination, env)
+        self.assertEqual(request.call_args.args[2]["transfer_mode"], "copy")
+        Path(self.source).unlink()
         env["Radarr_TransferMode"] = "Copy"
         with patch.object(hook, "request") as request, self.assertRaises(FileNotFoundError):
             hook.run_hook(self.config, self.source, self.destination, env)

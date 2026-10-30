@@ -38,6 +38,7 @@ Arr ──qB API──► arr-download ──AddOfflineFiles──► 115 离线
 
 - Arr 下载客户端设置里**打开“移除已完成”（Remove Completed）**时，Arr 用 Move 模式导入，`arr-import` 在云端直接移动、改名，不留副本；导入后 Arr 发 `torrents/delete`（`deleteFiles=true`），`delete_files=true` 时代理把这个任务的离线目录（剩下的 NFO、样片等）送进网盘回收站。
 - 不打开时 Arr 用 Copy 模式，`arr-import` 云端复制，下载目录保留，需要自己清理。
+- 想先复制、核验后再删源：Remove Completed 保持打开，在 hook 配置（`arr-import-hook.json`）里设 `"transfer_mode": "copy"`。导入一律云端复制，之后 Arr 的删除请求再由 `delete_files` 把离线目录送进回收站。
 
 `delete_files` 只会删除 `cloud_download_root/.arr-offline/<infohash>` 这一个目录，用的是 `DeleteFile`（进回收站），不是永久删除。
 
