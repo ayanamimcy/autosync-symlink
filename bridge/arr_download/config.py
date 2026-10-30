@@ -23,6 +23,9 @@ def load(path):
         raise ValueError("下载代理需要独立用户名和至少 24 字符的密码")
     for key in ("qb", "cloud"):
         http_url(c[key]["url"])
+    c["qb"].setdefault("timeout_seconds", 15)
+    if type(c["qb"]["timeout_seconds"]) is not int or not 3 <= c["qb"]["timeout_seconds"] <= 60:
+        raise ValueError("qb.timeout_seconds 必须是 3 到 60 的整数")
     if not secret(c["qb"].get("username", "")) or not secret(c["qb"]["password"]) or not secret(c["cloud"]["token"]):
         raise ValueError("需要 qB 登录信息及 CD2 API token")
     c["cloud"] = {**c["cloud"], "username": "", "password": ""}

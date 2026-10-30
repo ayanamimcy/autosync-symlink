@@ -390,38 +390,39 @@ class Downloader:
 
     def overlay(self, rows, category=None, hashes=None):
         rows = {row["hash"]: dict(row) for row in rows}
-        with self.lock:
-            for job in self.store.all():
-                if job.get("delivery_detached"):
-                    rows.pop(job["hash"], None)
-                    continue
-                if job["status"] in ("completed", "cancelled"):
-                    continue
-                if category is not None and category != job["category"]:
-                    continue
-                if hashes is not None and job["hash"] not in hashes:
-                    continue
-                meta = job.get("meta") or {"name": job["hash"], "size": 0}
-                row = rows.setdefault(job["hash"], {"hash": job["hash"], "name": meta["name"],
-                                                        "category": job["category"], "save_path": job["qb_path"],
-                                                        "content_path": job["qb_path"] + "/" + meta["name"]})
-                if deliverable(job):
-                    # This is the 115 download delivery view. It does not claim that
-                    # the separate real qB torrent has finished checking or is seeding.
-                    row.update(state="stoppedUP", progress=1, amount_left=0, size=meta["size"],
-                               total_size=meta["size"], completed=meta["size"],
-                               content_path=job["qb_path"] + "/" + meta["name"],
-                               completion_on=int(job.get("qb_checked_at") or job.get("cloud_ready_at") or self.clock()),
-                               dlspeed=0, upspeed=0, eta=0,
-                               arr_delivery_status="ready", arr_seeding_status=self.public(job)["seeding_status"])
-                    continue
-                row.update(state="error" if job["status"] == "failed" else
-                           "stoppedDL" if job["paused"] or not self.config["enabled"] else
-                           "checkingDL" if job["phase"] == "checking" else "downloading",
-                           progress=min(0.99, job["progress"]), size=meta["size"], total_size=meta["size"],
-                           amount_left=max(1, int(meta["size"] * (1 - job["progress"]))),
-                           dlspeed=0, upspeed=0, eta=8640000, added_on=int(job["started"]),
-                           downloaded=row.get("downloaded", 0), uploaded=row.get("uploaded", 0))
+        # Store.all() returns a coherent snapshot under its own short DB lock.
+        # Rendering must not wait for the worker's long qB/CD2 operations.
+        for job in self.store.all():
+            if job.get("delivery_detached"):
+                rows.pop(job["hash"], None)
+                continue
+            if job["status"] in ("completed", "cancelled"):
+                continue
+            if category is not None and category != job["category"]:
+                continue
+            if hashes is not None and job["hash"] not in hashes:
+                continue
+            meta = job.get("meta") or {"name": job["hash"], "size": 0}
+            row = rows.setdefault(job["hash"], {"hash": job["hash"], "name": meta["name"],
+                                                    "category": job["category"], "save_path": job["qb_path"],
+                                                    "content_path": job["qb_path"] + "/" + meta["name"]})
+            if deliverable(job):
+                # This is the 115 download delivery view. It does not claim that
+                # the separate real qB torrent has finished checking or is seeding.
+                row.update(state="stoppedUP", progress=1, amount_left=0, size=meta["size"],
+                           total_size=meta["size"], completed=meta["size"],
+                           content_path=job["qb_path"] + "/" + meta["name"],
+                           completion_on=int(job.get("qb_checked_at") or job.get("cloud_ready_at") or self.clock()),
+                           dlspeed=0, upspeed=0, eta=0,
+                           arr_delivery_status="ready", arr_seeding_status=self.public(job)["seeding_status"])
+                continue
+            row.update(state="error" if job["status"] == "failed" else
+                       "stoppedDL" if job["paused"] or not self.config["enabled"] else
+                       "checkingDL" if job["phase"] == "checking" else "downloading",
+                       progress=min(0.99, job["progress"]), size=meta["size"], total_size=meta["size"],
+                       amount_left=max(1, int(meta["size"] * (1 - job["progress"]))),
+                       dlspeed=0, upspeed=0, eta=8640000, added_on=int(job["started"]),
+                       downloaded=row.get("downloaded", 0), uploaded=row.get("uploaded", 0))
         return list(rows.values())
 
     def start(self):

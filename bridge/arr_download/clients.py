@@ -1,8 +1,10 @@
 import http.cookiejar
 import json
+import logging
 import re
 import secrets
 import threading
+import time
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, build_opener
@@ -36,27 +38,57 @@ class NoRedirect(HTTPRedirectHandler):
 class QB:
     def __init__(self, config):
         self.config, self.lock = config, threading.RLock()
-        self.opener = build_opener(NoRedirect(), HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.cookies = http.cookiejar.CookieJar()
+        self.local = threading.local()
         self.logged_in = False
+        self.generation = 0
+        self.status_lock = threading.Lock()
+        self.status = {"requests": 0, "failures": 0, "last_success": None, "last_error": None}
+
+    def diagnostics(self):
+        with self.status_lock:
+            return {**self.status}
+
+    def failure(self, path, error):
+        detail = {"endpoint": urlsplit(path).path, "kind": type(error).__name__,
+                  "stage": getattr(error, "arr_stage", "response_headers"),
+                  "seconds": round(getattr(error, "arr_elapsed", 0), 3), "time": time.time()}
+        if isinstance(error, HTTPError):
+            detail["http_status"] = error.code
+        with self.status_lock:
+            self.status["failures"] += 1
+            self.status["last_error"] = detail
+        logging.getLogger(__name__).warning("qB upstream failure: %s", json.dumps(detail))
+        failure = UpstreamError(f"qB {detail['endpoint']} {detail['stage']} 异常（{detail['kind']}，{detail['seconds']} 秒）")
+        if isinstance(error, HTTPError):
+            failure = UpstreamError(f"qB HTTP {error.code}；{detail['endpoint']}")
+        return failure
 
     def raw(self, path, data=None, content_type="application/x-www-form-urlencoded", method=None):
-        with self.lock:
-            for attempt in range(2):
+        for attempt in range(2):
+            # Serialize authentication only. A slow read must not hold up every
+            # other HTTP handler and the worker through one global network lock.
+            with self.lock:
                 if not self.logged_in:
                     self.login()
-                try:
-                    return self._raw(path, data, content_type, method)
-                except HTTPError as error:
-                    code = error.code
-                    error.close()
-                    if code in (401, 403) and not attempt:
-                        self.logged_in = False
-                        continue
-                    raise UpstreamError(f"qB HTTP {code}") from None
-                except UpstreamError:
-                    raise
-                except Exception as error:
-                    raise UpstreamError("qB 连接异常（" + type(error).__name__ + "）") from None
+                generation = self.generation
+            try:
+                return self._raw(path, data, content_type, method)
+            except HTTPError as error:
+                code = error.code
+                error.close()
+                if code in (401, 403) and not attempt:
+                    with self.lock:
+                        if generation == self.generation:
+                            self.logged_in = False
+                    continue
+                raise self.failure(path, error) from None
+            except UpstreamError:
+                raise
+            except Exception as error:
+                # A timeout on a write is ambiguous. Never replay add/start/delete
+                # or other mutations merely because the response was lost.
+                raise self.failure(path, error) from None
 
     def _raw(self, path, data, content_type, method=None):
         url = self.config["url"].rstrip("/")
@@ -64,21 +96,39 @@ class QB:
         req = Request(url + path, data=data, method=method,
                       headers={"Content-Type": content_type, "Referer": url + "/",
                                "Origin": origin.scheme + "://" + origin.netloc})
-        with self.opener.open(req, timeout=15) as response:
-            payload = response.read(16 * 1024 * 1024 + 1)
-            if len(payload) > 16 * 1024 * 1024:
-                raise UpstreamError("qB 响应过大")
-            return payload, response.headers.get("Content-Type", "application/json")
+        # Each thread owns its opener/handlers; only the internally locked
+        # CookieJar is shared, so all threads reuse the same authenticated SID.
+        if not hasattr(self.local, "opener"):
+            self.local.opener = build_opener(NoRedirect(), HTTPCookieProcessor(self.cookies))
+        start, stage = time.monotonic(), "response_headers"
+        with self.status_lock:
+            self.status["requests"] += 1
+        try:
+            with self.local.opener.open(req, timeout=self.config.get("timeout_seconds", 15)) as response:
+                stage = "response_body"
+                payload = response.read(16 * 1024 * 1024 + 1)
+                if len(payload) > 16 * 1024 * 1024:
+                    raise UpstreamError("qB 响应过大")
+                result = payload, response.headers.get("Content-Type", "application/json")
+            with self.status_lock:
+                self.status["last_success"] = time.time()
+            return result
+        except Exception as error:
+            error.arr_stage, error.arr_elapsed = stage, time.monotonic() - start
+            raise
 
     def login(self):
         data = urlencode({"username": secret(self.config["username"]), "password": secret(self.config["password"])}).encode()
         try:
             payload, _ = self._raw("/api/v2/auth/login", data, "application/x-www-form-urlencoded")
-        except Exception:
-            raise UpstreamError("qB 登录连接失败") from None
+        except Exception as error:
+            if isinstance(error, HTTPError):
+                error.close()
+            raise self.failure("/api/v2/auth/login", error) from None
         if payload.strip() != b"Ok.":
             raise UpstreamError("qB 登录失败")
         self.logged_in = True
+        self.generation += 1
 
     def get(self, path, **params):
         payload, _ = self.raw("/api/v2/" + path + ("?" + urlencode(params) if params else ""))

@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from bridge.config import secret
 from .clients import UpstreamError
 from .metadata import MAX_META
+from .read_cache import AppReadCache
 from .service import deliverable
 
 READS = {"app/version", "app/webapiVersion", "app/preferences", "torrents/properties",
@@ -56,10 +57,12 @@ def form(body, content_type):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
     def __init__(self, downloader):
         self.downloader = downloader
         self.sessions, self.session_lock = {}, threading.RLock()
+        self.app_cache = AppReadCache(wait_seconds=downloader.config["qb"].get("timeout_seconds", 15) + 2)
         super().__init__((downloader.config["host"], downloader.config["port"]), Handler)
 
 
@@ -74,7 +77,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, status, body, content_type="application/json", cookie=None):
+    def reply(self, status, body, content_type="application/json", cookie=None, headers=None):
         if not isinstance(body, bytes):
             body = json.dumps(body, ensure_ascii=False).encode()
         self.send_response(status)
@@ -83,6 +86,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         if cookie:
             self.send_header("Set-Cookie", cookie)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -143,6 +148,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.sessions.pop(sid, None)
                 self.reply(200, b"", "text/plain", "SID=; Path=/; Max-Age=0")
                 return
+            if not post and url.path == "/v1/diagnostics":
+                self.reply(200, {"qb": d.qb.diagnostics(), "app_cache": self.server.app_cache.diagnostics()})
+                return
             job_route = re.fullmatch(r"/v1/downloads/([a-f0-9]{40})(/retry)?", url.path)
             if job_route:
                 infohash, retry = job_route.groups()
@@ -199,6 +207,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, rows[offset:offset + limit] if limit else rows[offset:])
                 return
             if not post and path in READS:
+                if path in AppReadCache.POLICIES:
+                    def fetch_app():
+                        payload, typ = d.qb.raw("/api/v2/" + path)
+                        if path == "app/preferences":
+                            # Do not retain qB authentication settings in the cache.
+                            try:
+                                preferences = json.loads(payload)
+                                if not isinstance(preferences, dict):
+                                    raise ValueError()
+                            except (ValueError, UnicodeError):
+                                raise UpstreamError("qB app/preferences 返回无效 JSON 对象") from None
+                            payload = json.dumps({k: v for k, v in preferences.items() if k in PREFERENCES}).encode()
+                            typ = "application/json"
+                        elif not re.fullmatch(rb"v?[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.]+)?", payload.strip()):
+                            raise UpstreamError("qB 版本接口返回无效版本号；未更新缓存")
+                        return payload, typ
+                    payload, typ, status = self.server.app_cache.get(path, fetch_app)
+                    self.reply(200, payload, typ, headers={"X-Arr-App-Cache": status})
+                    return
                 if path in ("torrents/properties", "torrents/files", "torrents/trackers"):
                     query = parse_qs(url.query, max_num_fields=100)
                     job = d.store.get(query.get("hash", [""])[0])
@@ -224,10 +251,7 @@ class Handler(BaseHTTPRequestHandler):
                             self.reply(200, [])
                             return
                 payload, typ = d.qb.raw(url.path + ("?" + url.query if url.query else ""))
-                if path == "app/preferences":
-                    self.reply(200, {k: v for k, v in json.loads(payload).items() if k in PREFERENCES})
-                else:
-                    self.reply(200, payload, typ)
+                self.reply(200, payload, typ)
                 return
             if post and path in WRITES:
                 values, torrent = form(body, content_type)
