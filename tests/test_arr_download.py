@@ -2,9 +2,8 @@ import base64
 import copy
 import hashlib
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-import posixpath
+import struct
 import tempfile
 import threading
 import unittest
@@ -14,11 +13,15 @@ from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 import http.cookiejar
 
-from bridge.arr_download.clients import OfflineCloud, QB, UpstreamError, multipart
+from bridge.arr_download.clients import OfflineCloud, UpstreamError
 from bridge.arr_download.config import load
-from bridge.arr_download.metadata import magnet, metainfo, offline_magnet
-from bridge.arr_download.service import Downloader, Store, deliverable
-from bridge.arr_download.web import Server, form
+from bridge.arr_download.metadata import magnet, magnet_parts, metainfo, offline_magnet
+from bridge.arr_download.service import Downloader, Store, complete
+from bridge.arr_download.web import Server
+from bridge.arr_import.cloud import OperationRejected, number
+from bridge.protocol import text_field, varint
+
+MB = 1024 * 1024
 
 
 def bencode(value):
@@ -31,563 +34,346 @@ def bencode(value):
     return b"d" + b"".join(bencode(k) + bencode(v) for k, v in sorted(value.items())) + b"e"
 
 
-def torrent(private=False):
-    info = {b"name": "Show & 电影".encode(), b"piece length": 16, b"pieces": b"p" * 40,
-            b"files": [{b"path": [b"Show.S01E01.mkv"], b"length": 20},
-                       {b"path": [b"release.nfo"], b"length": 4}]}
+def torrent(private=False, padding=False):
+    files = [{b"path": [b"Show.S01E01.mkv"], b"length": 3 * MB},
+             {b"path": [b"release.nfo"], b"length": 4}]
+    if padding:
+        files.insert(1, {b"path": [b".pad", b"100"], b"length": 100, b"attr": b"p"})
+    size = sum(f[b"length"] for f in files)
+    info = {b"name": "Show & 电影".encode(), b"piece length": MB, b"pieces": b"p" * 20 * -(-size // MB),
+            b"files": files}
     if private:
         info[b"private"] = 1
-    return bencode({b"announce": b"https://tracker.example/announce", b"info": info})
+    return bencode({b"announce": b"https://tracker.example/announce",
+                    b"announce-list": [[b"udp://open.example:1337"], [b"wss://ignored.example"]], b"info": info})
 
 
 def config():
     return {"enabled": True, "host": "127.0.0.1", "port": 0,
             "username": "arr", "password": "gateway-secret-" * 3,
-            "qb": {"url": "http://qb:8080", "username": "admin", "password": "qb-secret"},
             "cloud": {"url": "http://cd2:19798", "token": "cloud-secret"},
             "account_root": "/115open", "cloud_download_root": "/115open/pt/download",
-            "qb_download_root": "/downloads", "offline_categories": ["radarr", "sonarr"],
-            "seed_after_check": True, "poll_seconds": 1, "settle_seconds": 2,
-            "timeout_seconds": 86400, "max_errors": 3}
+            "arr_download_root": "/downloads", "categories": ["radarr", "sonarr"],
+            "poll_seconds": 1, "settle_seconds": 2, "timeout_seconds": 86400, "max_errors": 3,
+            "send_trackers": True, "delete_files": True, "retired_keys": [],
+            "arr": [{"category": "radarr", "url": "http://radarr:7878", "api_key": "radarr-key"}]}
 
 
-class FakeQB:
-    def __init__(self):
-        self.rows, self.manifests, self.calls = {}, {}, []
-        self.exported = torrent()
-        self.lose_start_response = False
-
-    def info(self, infohash):
-        return copy.deepcopy(self.rows.get(infohash))
-
-    def add(self, job, raw):
-        self.calls.append(("add", job["hash"]))
-        self.rows[job["hash"]] = {"hash": job["hash"], "category": job["category"],
-                                  "save_path": job["qb_path"], "tags": job["tag"], "state": "stoppedDL",
-                                  "progress": 0, "amount_left": 24, "auto_tmm": False}
-        if raw:
-            self.metadata(job["hash"], raw)
-
-    def metadata(self, infohash, raw):
-        meta = metainfo(raw, allow_private=True)
-        self.exported = raw
-        self.manifests[infohash] = [{"name": f["path"], "size": f["size"], "progress": 0, "priority": 1}
-                                    for f in meta["files"]]
-
-    def export(self, infohash):
-        return self.exported
-
-    def get(self, path, **params):
-        if path == "torrents/info":
-            return copy.deepcopy(list(self.rows.values()))
-        if path == "torrents/files":
-            return copy.deepcopy(self.manifests.get(params["hash"], []))
-        if path == "torrents/categories":
-            return {"radarr": {"savePath": "/downloads"}, "sonarr": {"savePath": "/downloads"}}
-        raise AssertionError(path)
-
-    def post(self, path, **values):
-        self.calls.append((path, values))
-        infohash = values.get("hashes", "")
-        if path == "torrents/recheck":
-            self.rows[infohash]["state"] = "checkingDL"
-        elif path == "torrents/start":
-            self.rows[infohash]["state"] = "stalledUP"
-            if self.lose_start_response:
-                self.lose_start_response = False
-                raise UpstreamError("qB 连接异常（TimeoutError）")
-        elif path == "torrents/stop":
-            self.rows[infohash]["state"] = "stoppedDL" if self.rows[infohash]["progress"] < 1 else "stoppedUP"
-        elif path == "torrents/delete":
-            assert values["deleteFiles"] == "false"
-            self.rows.pop(infohash, None)
-        return b""
-
-    def finish(self, infohash, success=True):
-        self.rows[infohash].update(state="stoppedUP" if success else "stoppedDL",
-                                  progress=1 if success else 0.5, amount_left=0 if success else 12)
-        for row in self.manifests[infohash]:
-            row["progress"] = 1 if success else 0.5
-
-    def raw(self, path, data=None, content_type=None):
-        if path == "/api/v2/app/version":
-            return b"v5.1.4", "text/plain"
-        if path == "/api/v2/app/webapiVersion":
-            return b"2.11.5", "text/plain"
-        if path == "/api/v2/app/preferences":
-            return json.dumps({"save_path": "/downloads", "temp_path_enabled": False,
-                               "web_ui_password": "MUST-NOT-LEAK"}).encode(), "application/json"
-        self.calls.append(("raw", path))
-        return b"Ok.", "text/plain"
+def cloud_file(path, size, sha1="a" * 40):
+    return {"path": path, "name": path.rsplit("/", 1)[1], "id": "id-" + path, "directory": False,
+            "local": False, "size": size, "hashes": {2: sha1}}
 
 
 class FakeCloud:
+    """115 offline as CD2 shows it: a task list per folder and the files it produced."""
+
     def __init__(self):
-        self.calls, self.tasks, self.files = [], {}, {}
-        self.upload_tasks = []
-        self.hide_task = False
-        self.lose_offline_response = False
+        self.tasks, self.files, self.calls = {}, {}, []
+        self.reject = False
+        self.lose_add_reply = False
 
     def mkdir(self, path, account):
         self.calls.append(("mkdir", path))
 
     def offline(self, folder):
-        return [] if self.hide_task else copy.deepcopy(self.tasks.get(folder, []))
+        return copy.deepcopy(self.tasks.get(folder, []))
 
     def add_offline(self, link, folder):
-        self.calls.append(("add_offline", link, folder))
-        self.tasks[folder] = [{"hash": magnet(link), "status": 1}]
-        if self.lose_offline_response:
-            self.lose_offline_response = False
-            raise UpstreamError("CD2 AddOfflineFiles：TimeoutError")
+        self.calls.append(("add", link, folder))
+        if self.reject or any(t["hash"] == magnet(link) for tasks in self.tasks.values() for t in tasks):
+            raise OperationRejected("rejected")  # 115: "任务已存在" for a known infohash
+        self.tasks[folder] = [{"hash": magnet(link), "name": magnet_parts(link)[0], "size": 0,
+                               "status": 0, "percent": 0.0, "peers": 0}]
+        if self.lose_add_reply:
+            raise TimeoutError("reply lost")
 
-    def complete(self, job):
-        self.tasks[job["cloud_path"]] = [{"hash": job["hash"], "status": 2}]
-        for entry in job["meta"]["files"]:
-            path = job["cloud_path"] + "/" + entry["path"]
-            self.files[path] = {"path": path, "size": entry["size"], "directory": False,
-                                "local": False, "id": "115-file-id", "hashes": {2: "a" * 40}}
+    def remove_offline(self, infohash, path):
+        self.calls.append(("remove_offline", infohash, path))
+        for folder in self.tasks:
+            self.tasks[folder] = [t for t in self.tasks[folder] if t["hash"] != infohash]
 
-    def list_files(self, parent):
-        return copy.deepcopy([f for path, f in self.files.items() if posixpath.dirname(path) == parent])
+    def progress(self, folder, status, percent=0.0, size=0):
+        self.tasks[folder][0].update(status=status, percent=percent, size=size or self.tasks[folder][0]["size"])
 
-    def uploads(self, path):
-        return copy.deepcopy(self.upload_tasks)
+    def land(self, folder, files):
+        for rel, size in files.items():
+            self.files[folder + "/" + rel] = cloud_file(folder + "/" + rel, size)
+
+    def walk(self, path):
+        found = {p[len(path) + 1:]: copy.deepcopy(f) for p, f in self.files.items() if p.startswith(path + "/")}
+        return found or None
+
+    def get_file(self, path):
+        if path in self.files or any(p.startswith(path + "/") for p in self.files):
+            return {"path": path}
+        return None
+
+    def delete(self, path):
+        self.calls.append(("delete", path))
+        self.files = {p: f for p, f in self.files.items() if not p.startswith(path + "/")}
 
 
-class DownloadTests(unittest.TestCase):
+class FakeArr:
+    def __init__(self):
+        self.failed = []
+
+    def __call__(self, instance):
+        return self
+
+    def mark_failed(self, infohash):
+        self.failed.append(infohash)
+        return True
+
+
+class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = Store(Path(self.tmp.name) / "downloads.sqlite3")
         self.addCleanup(lambda: self.store.close())
-        self.cfg, self.qb, self.cloud, self.now = config(), FakeQB(), FakeCloud(), 1000
-        self.d = Downloader(self.cfg, self.store, self.qb, lambda _: self.cloud, lambda: self.now)
+        self.cloud, self.arr = FakeCloud(), FakeArr()
+        self.time = 1000.0
+        self.cfg = config()
+        self.d = Downloader(self.cfg, self.store, lambda _: self.cloud, self.arr, lambda: self.time)
 
-    def submit(self, raw=None):
-        return self.d.submit({"category": "radarr"}, raw or torrent())["hash"]
-
-    def tick(self, count=1):
-        for _ in range(count):
+    def ticks(self, n=1, step=1):
+        for _ in range(n):
             self.d.tick()
-            self.now += 3
+            self.time += step
 
     def job(self, infohash):
         return self.store.get(infohash)
 
-    def checking(self, infohash):
-        self.tick(4)
-        self.cloud.complete(self.job(infohash))
-        self.tick(4)
-        self.assertEqual(self.job(infohash)["phase"], "checking")
 
-    def test_offline_full_check_then_seed_and_arr_completion_gate(self):
-        infohash = self.submit()
-        self.checking(infohash)
-        self.assertEqual(self.job(infohash)["status"], "checking")
-        rows = self.d.overlay(self.qb.get("torrents/info"))
-        self.assertLess(rows[0]["progress"], 1)
-        self.assertGreater(rows[0]["amount_left"], 0)
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
-        source = copy.deepcopy(self.cloud.files)
-        self.qb.finish(infohash)
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["status"], "completed")
-        self.assertEqual(self.qb.rows[infohash]["state"], "stalledUP")
-        self.assertEqual(self.cloud.files, source)
-        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add_offline"]), 1)
-        self.assertEqual(self.submit(), infohash)
-        self.assertTrue(all(c[0] in ("mkdir", "add_offline") for c in self.cloud.calls))
+class OfflineTests(Base):
+    def test_torrent_offline_verify_ready_and_qb_views(self):
+        meta = metainfo(torrent())
+        job = self.d.submit({"category": "radarr"}, torrent())
+        folder = "/115open/pt/download/.arr-offline/" + meta["hash"]
+        self.ticks()
+        add = [c for c in self.cloud.calls if c[0] == "add"]
+        self.assertEqual(len(add), 1)
+        self.assertEqual(add[0][2], folder)
+        self.assertEqual(magnet(add[0][1]), meta["hash"])
+        self.assertIn("tracker.example", add[0][1])
+        self.assertNotIn("wss", add[0][1])
+        self.assertEqual(self.d.row(self.job(job["hash"]))["state"], "metaDL")
+        self.cloud.progress(folder, 1, 40.0)
+        self.ticks()
+        row = self.d.row(self.job(job["hash"]))
+        self.assertEqual(row["state"], "downloading")
+        self.assertAlmostEqual(row["progress"], 0.396)
+        self.cloud.progress(folder, 2, 100.0)
+        self.ticks()
+        self.assertEqual(self.job(job["hash"])["status"], "verifying")
+        # 115 kept the torrent's root folder but skipped the tiny .nfo.
+        self.cloud.land(folder, {"Show & 电影/Show.S01E01.mkv": 3 * MB})
+        self.ticks(3, step=2)
+        done = self.job(job["hash"])
+        self.assertEqual(done["status"], "ready")
+        row = self.d.row(done)
+        self.assertEqual(row["state"], "stoppedUP")
+        self.assertEqual(row["save_path"], "/downloads/.arr-offline/" + meta["hash"])
+        self.assertEqual(row["content_path"], "/downloads/.arr-offline/" + meta["hash"] + "/Show & 电影")
+        self.assertEqual(row["ratio_limit"], 0)  # lets Arr move instead of copy when it removes completed items
+        self.assertEqual(self.d.files(done)[0]["name"], "Show & 电影/Show.S01E01.mkv")
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add"]), 1)
 
-    def test_missing_extra_file_or_upload_in_progress_prevents_recheck(self):
-        infohash = self.submit()
-        self.tick(4)
-        self.cloud.complete(self.job(infohash))
-        extra = next(path for path in self.cloud.files if path.endswith(".nfo"))
-        f = self.cloud.files.pop(extra)
-        self.tick(6)
-        self.assertEqual(self.job(infohash)["phase"], "remote_verify")
-        self.cloud.files[extra] = f
-        self.cloud.upload_tasks = [{"state": 1}]
-        self.tick(5)
-        self.assertFalse(any(c[0] == "torrents/recheck" for c in self.qb.calls))
-        self.cloud.upload_tasks = []
-        self.tick(3)
-        self.assertEqual(self.job(infohash)["phase"], "checking")
+    def test_single_file_without_root_folder_and_several_top_entries(self):
+        link = "magnet:?xt=urn:btih:" + "c" * 40 + "&dn=Movie.2026.mkv&tr=udp%3A%2F%2Ft.example%3A1"
+        self.d.submit({"category": "radarr", "urls": link})
+        folder = "/115open/pt/download/.arr-offline/" + "c" * 40
+        self.ticks()
+        self.cloud.progress(folder, 2, 100.0, size=5 * MB)
+        self.ticks()
+        self.cloud.land(folder, {"Movie.2026.mkv": 2 * MB})
+        self.ticks(3, step=2)
+        self.assertEqual(self.job("c" * 40)["status"], "verifying")  # total size not reached yet
+        self.cloud.land(folder, {"Sample/sample.mkv": 3 * MB})
+        self.ticks(3, step=2)
+        job = self.job("c" * 40)
+        self.assertEqual(job["status"], "ready")
+        self.assertEqual(job["size"], 5 * MB)
+        self.assertEqual(self.d.paths(job), ("/downloads/.arr-offline", "/downloads/.arr-offline/" + "c" * 40))
+        self.assertEqual(sorted(f["name"] for f in self.d.files(job)),
+                         ["c" * 40 + "/Movie.2026.mkv", "c" * 40 + "/Sample/sample.mkv"])
 
-    def test_partial_check_fails_without_starting_download(self):
-        infohash = self.submit()
-        self.checking(infohash)
-        self.tick()  # Observe checking before completion.
-        self.qb.finish(infohash, False)
-        self.tick()
-        self.assertEqual(self.job(infohash)["status"], "failed")
-        self.assertIn("100%", self.job(infohash)["message"])
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
+    def test_listing_must_stay_unchanged_for_settle_time(self):
+        job = self.d.submit({"category": "radarr"}, torrent())
+        folder = "/115open/pt/download/.arr-offline/" + job["hash"]
+        self.ticks()
+        self.cloud.progress(folder, 2, 100.0)
+        self.ticks()
+        self.cloud.land(folder, {"Show.S01E01.mkv": 3 * MB})
+        self.ticks(1)
+        self.cloud.files[folder + "/Show.S01E01.mkv"]["hashes"][2] = "b" * 40
+        self.ticks(1, step=1)
+        self.assertEqual(self.job(job["hash"])["status"], "verifying")
+        self.ticks(2, step=2)
+        self.assertEqual(self.job(job["hash"])["status"], "ready")
 
-    def test_checked_delivery_does_not_wait_for_seeding_start(self):
-        infohash = self.submit()
-        self.checking(infohash)
-        self.assertFalse(deliverable(self.job(infohash)))
-        self.qb.finish(infohash)
-        self.tick()
-        self.assertEqual(self.job(infohash)["phase"], "verified")
-        self.assertTrue(deliverable(self.job(infohash)))
-        self.assertEqual(self.d.overlay(self.qb.get("torrents/info"))[0]["progress"], 1)
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
-        self.tick()
-        self.assertEqual(self.qb.rows[infohash]["state"], "stalledUP")
+    def test_offline_failure_marks_arr_failed_once(self):
+        job = self.d.submit({"category": "radarr"}, torrent())
+        folder = "/115open/pt/download/.arr-offline/" + job["hash"]
+        self.ticks()
+        self.cloud.progress(folder, 3)
+        self.ticks(3)
+        failed = self.job(job["hash"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(self.d.row(failed)["state"], "error")
+        self.assertEqual(self.arr.failed, [job["hash"]])
+        self.assertIn("已通知 Arr", failed["message"])
 
-    def test_cloud_ready_delivery_and_cleanup_preserve_background_check_and_seed(self):
-        self.cfg["import_after"] = "cloud_ready"
-        infohash = self.submit()
-        self.cfg["import_after"] = "qb_checked"  # Existing jobs keep their chosen mode.
-        self.tick(4)
-        self.cloud.complete(self.job(infohash))
-        self.tick(2)
-        self.assertFalse(deliverable(self.job(infohash)))  # Still stabilizing.
-        self.tick(2)
-        public = self.d.public(self.job(infohash))
-        self.assertEqual(public["delivery_status"], "ready")
-        self.assertEqual(public["seeding_status"], "checking")
-        self.assertFalse(public["qb_checked"])
-        row = self.d.overlay(self.qb.get("torrents/info"))[0]
-        self.assertEqual((row["progress"], row["amount_left"]), (1, 0))
-        self.assertEqual(self.qb.rows[infohash]["state"], "checkingDL")
-        before = copy.deepcopy(self.qb.calls)
-        self.assertEqual(self.d.control([infohash], "delete"), [])
-        self.assertEqual(self.qb.calls, before)
-        self.assertEqual(self.d.overlay(self.qb.get("torrents/info")), [])
-        self.d = Downloader(self.cfg, self.store, self.qb, lambda _: self.cloud, lambda: self.now)
-        self.tick()
-        self.qb.finish(infohash)
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["status"], "completed")
-        self.assertEqual(self.qb.rows[infohash]["state"], "stalledUP")
-        self.assertEqual(self.d.public(self.job(infohash))["delivery_status"], "removed")
-        self.assertEqual(self.d.overlay(self.qb.get("torrents/info")), [])
-        self.assertFalse(any(c[0] in ("torrents/delete", "torrents/stop") for c in self.qb.calls))
+    def test_existing_115_record_is_cleared_once_then_resubmitted(self):
+        job = self.d.submit({"category": "radarr"}, torrent())
+        self.cloud.tasks["/115open/elsewhere"] = [{"hash": job["hash"], "name": "", "size": 0, "status": 2,
+                                                    "percent": 100.0, "peers": 0}]
+        self.ticks()
+        self.assertIn(("remove_offline", job["hash"], "/115open"), self.cloud.calls)
+        self.assertEqual(self.job(job["hash"])["status"], "queued")
+        self.ticks(2)
+        self.assertEqual(self.job(job["hash"])["status"], "downloading")
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add"]), 2)
 
-    def test_parallel_check_failure_reports_warning_and_retry_rechecks(self):
-        self.cfg["import_after"] = "cloud_ready"
-        infohash = self.submit()
-        self.checking(infohash)
-        self.tick()
-        self.qb.finish(infohash, False)
-        before = copy.deepcopy(self.cloud.files)
-        self.tick()
-        public = self.d.public(self.job(infohash))
-        self.assertEqual((public["delivery_status"], public["seeding_status"]), ("ready", "failed"))
-        self.assertIn("delivery_warning", public)
-        self.assertEqual(self.cloud.files, before)
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
-        self.d.retry(infohash)
-        self.assertFalse(deliverable(self.job(infohash)))
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["phase"], "checking")
-        self.assertEqual(len([c for c in self.qb.calls if c[0] == "torrents/recheck"]), 2)
-        self.qb.finish(infohash)
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["status"], "completed")
+    def test_rejected_submit_fails_and_sonarr_without_arr_config_is_not_notified(self):
+        self.cloud.reject = True
+        job = self.d.submit({"category": "sonarr"}, torrent())
+        self.ticks(3)
+        self.assertEqual(self.job(job["hash"])["status"], "failed")
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "remove_offline"]), 1)
+        self.assertEqual(self.arr.failed, [])
+        self.cloud.reject = False
+        self.d.retry(job["hash"])
+        self.ticks()
+        self.assertEqual(self.job(job["hash"])["status"], "queued")
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add"]), 3)
 
-    def test_parallel_remote_change_blocks_further_delivery(self):
-        self.cfg["import_after"] = "cloud_ready"
-        infohash = self.submit()
-        self.checking(infohash)
-        self.assertTrue(deliverable(self.job(infohash)))
-        next(iter(self.cloud.files.values()))["hashes"][2] = "b" * 40
-        self.qb.finish(infohash)
-        self.tick()
-        self.assertEqual(self.d.public(self.job(infohash))["delivery_status"], "blocked")
-        self.assertLess(self.d.overlay(self.qb.get("torrents/info"))[0]["progress"], 1)
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
+    def test_lost_submit_reply_is_reconciled_by_listing_never_resubmitted(self):
+        self.cloud.lose_add_reply = True
+        job = self.d.submit({"category": "radarr"}, torrent())
+        self.ticks()
+        self.store.close()
+        self.store = Store(Path(self.tmp.name) / "downloads.sqlite3")
+        self.d = Downloader(self.cfg, self.store, lambda _: self.cloud, self.arr, lambda: self.time)
+        self.ticks(3)
+        self.assertEqual(self.job(job["hash"])["status"], "downloading")
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add"]), 1)
 
-    def test_completed_delivery_cleanup_keeps_real_seeder(self):
-        infohash = self.submit()
-        self.checking(infohash)
-        self.qb.finish(infohash)
-        self.tick(2)
-        self.assertEqual(self.d.control([infohash], "delete"), [])
-        self.assertEqual(self.qb.rows[infohash]["state"], "stalledUP")
-        self.assertEqual(self.d.overlay(self.qb.get("torrents/info")), [])
+    def test_submitted_task_never_listed_fails_after_grace(self):
+        job = self.d.submit({"category": "sonarr"}, torrent())
+        self.ticks()
+        self.cloud.tasks.clear()
+        self.ticks(1, step=601)
+        self.ticks(1)
+        self.assertEqual(self.job(job["hash"])["status"], "failed")
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add"]), 1)
 
-    def test_remote_stability_restarts_after_upload_reappears(self):
-        infohash = self.submit()
-        self.tick(4)
-        self.cloud.complete(self.job(infohash))
-        self.tick(2)
-        self.assertIn("stable_since", self.job(infohash))
-        self.cloud.upload_tasks = [{"state": 1}]
-        self.tick()
-        self.assertNotIn("stable_since", self.job(infohash))
-        self.cloud.upload_tasks = []
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["phase"], "checking")
-        self.assertEqual(self.job(infohash)["errors"], 0)
+    def test_timeout_and_transient_errors(self):
+        job = self.d.submit({"category": "sonarr"}, torrent())
+        with patch.object(self.cloud, "offline", side_effect=UpstreamError("CD2 ListOfflineFilesByPath：gRPC 14")):
+            self.ticks(2)
+            self.assertEqual(self.job(job["hash"])["status"], "queued")
+            self.assertIn("gRPC 14", self.job(job["hash"])["message"])
+            self.ticks(1)
+        self.assertEqual(self.job(job["hash"])["status"], "failed")
+        other = self.d.submit({"category": "sonarr", "urls": "magnet:?xt=urn:btih:" + "d" * 40}, None)
+        self.time += 86401
+        self.ticks()
+        self.assertEqual(self.job(other["hash"])["status"], "failed")
 
-    def test_uncertain_offline_submit_reconciles_after_restart_without_resubmit(self):
-        infohash = self.submit()
-        self.cloud.lose_offline_response = True
-        self.tick(4)
-        self.cloud.hide_task = True
-        self.d = Downloader(self.cfg, self.store, self.qb, lambda _: self.cloud, lambda: self.now)
-        self.tick(5)
-        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add_offline"]), 1)
-        self.cloud.hide_task = False
-        self.cloud.complete(self.job(infohash))
-        self.tick(4)
-        self.qb.finish(infohash)
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["status"], "completed")
+    def test_remove_with_delete_files_recycles_only_its_folder(self):
+        job = self.d.submit({"category": "radarr"}, torrent())
+        folder = "/115open/pt/download/.arr-offline/" + job["hash"]
+        self.ticks()
+        self.cloud.progress(folder, 2, 100.0)
+        self.cloud.land(folder, {"Show.S01E01.mkv": 3 * MB})
+        self.cloud.files["/115open/pt/download/other/keep.mkv"] = cloud_file("/115open/pt/download/other/keep.mkv", 1)
+        self.ticks(4, step=2)
+        self.d.remove([job["hash"]], delete_data=True)
+        self.assertEqual(self.d.rows(), [])
+        self.ticks()
+        self.assertEqual([c for c in self.cloud.calls if c[0] == "delete"], [("delete", folder)])
+        self.assertIn(("remove_offline", job["hash"], "/115open"), self.cloud.calls)
+        self.assertIn("/115open/pt/download/other/keep.mkv", self.cloud.files)
+        self.assertFalse(self.job(job["hash"])["remove_data"])
+        self.ticks()
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "delete"]), 1)
 
-    def test_lost_start_response_recovers_without_stopping_verified_seeder(self):
-        infohash = self.submit()
-        self.checking(infohash)
-        self.qb.finish(infohash)
-        self.qb.lose_start_response = True
-        self.tick(3)
-        self.assertEqual(self.job(infohash)["status"], "completed")
-        self.assertEqual(len([c for c in self.qb.calls if c[0] == "torrents/start"]), 1)
-        self.assertFalse(any(c[0] == "torrents/stop" for c in self.qb.calls))
+    def test_remove_while_downloading_stops_115_task_but_keeps_files_without_delete_option(self):
+        self.cfg["delete_files"] = False
+        job = self.d.submit({"category": "radarr"}, torrent())
+        self.ticks()
+        self.d.remove([job["hash"]], delete_data=True)
+        self.ticks(2)
+        self.assertFalse(any(c[0] == "delete" for c in self.cloud.calls))
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "remove_offline"]), 1)
+        self.assertEqual(self.cloud.tasks["/115open/pt/download/.arr-offline/" + job["hash"]], [])
+        again = self.d.submit({"category": "radarr"}, torrent())
+        self.ticks()
+        self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add"]), 2)
+        self.assertEqual(self.job(again["hash"])["status"], "queued")
 
-    def test_changed_remote_content_during_check_prevents_seed(self):
-        infohash = self.submit()
-        self.checking(infohash)
-        next(iter(self.cloud.files.values()))["hashes"][2] = "b" * 40
-        self.qb.finish(infohash)
-        self.tick()
-        self.assertEqual(self.job(infohash)["status"], "failed")
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
+    def test_remove_during_worker_pass_is_not_lost(self):
+        job = self.d.submit({"category": "radarr"}, torrent())
+        original = self.cloud.offline
 
-    def test_existing_qb_torrent_is_never_taken_over(self):
-        infohash = metainfo(torrent())["hash"]
-        self.qb.rows[infohash] = {"state": "stalledUP"}
+        def offline(folder):
+            self.d.remove([job["hash"]], delete_data=False)
+            return original(folder)
+        with patch.object(self.cloud, "offline", side_effect=offline):
+            self.ticks()
+        self.assertTrue(self.job(job["hash"])["removed"])
+
+    def test_duplicate_category_disabled_and_regrab_after_removal(self):
+        job = self.d.submit({"category": "radarr"}, torrent())
+        with self.assertRaises(FileExistsError):
+            self.d.submit({"category": "radarr"}, torrent())
         with self.assertRaises(ValueError):
-            self.submit()
-        self.assertEqual(self.qb.calls, [])
-        self.assertEqual(self.store.all(), [])
-
-    def test_magnet_waits_for_metadata_and_rejects_private_before_offline(self):
-        raw = torrent(True)
-        infohash = metainfo(raw, allow_private=True)["hash"]
-        self.d.submit({"category": "sonarr", "urls": offline_magnet(infohash)})
-        self.tick(5)
-        self.assertEqual(self.job(infohash)["phase"], "metadata")
-        self.assertEqual(self.cloud.calls, [])
-        self.qb.metadata(infohash, raw)
-        self.tick()
-        self.assertEqual(self.job(infohash)["status"], "failed")
-        self.assertEqual(self.cloud.calls, [])
-
-    def test_public_magnet_exports_original_metadata_then_offline(self):
-        raw = torrent()
-        infohash = metainfo(raw)["hash"]
-        self.d.submit({"category": "sonarr", "urls": offline_magnet(infohash) + "&tr=https://tracker.example"})
-        self.tick(3)
-        self.qb.metadata(infohash, raw)
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["meta"]["hash"], infohash)
-        self.assertEqual(self.cloud.calls[-1][0], "add_offline")
-        self.assertNotIn("tracker", self.cloud.calls[-1][1])
-
-    def test_pause_cancel_preserves_cloud_data_and_blocks_unsafe_controls(self):
-        infohash = self.submit()
-        self.tick(4)
-        self.cloud.complete(self.job(infohash))
-        before = copy.deepcopy(self.cloud.files)
-        self.assertEqual(self.d.control([infohash], "stop"), [])
-        self.tick(3)
-        self.assertTrue(self.job(infohash)["paused"])
-        for action in ("setCategory", "recheck", "setLocation"):
-            with self.assertRaises(ValueError):
-                self.d.control([infohash], action)
-        self.assertEqual(self.d.control([infohash], "setShareLimits"), [infohash])
-        self.assertEqual(self.d.control([infohash], "delete"), [])
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["status"], "cancelled")
-        self.assertEqual(self.cloud.files, before)
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
-
-    def test_independent_native_mode_and_seed_switch(self):
-        infohash = self.submit()
-        self.assertIsNone(self.d.submit({"category": "native"}, torrent(True)))
+            self.d.submit({"category": "other"}, torrent())
+        with self.assertRaises(ValueError):
+            self.d.submit({"category": "radarr"}, torrent(private=True))
+        self.d.remove([job["hash"]], False)
+        again = self.d.submit({"category": "radarr"}, torrent())
+        self.assertEqual(again["status"], "queued")
+        self.assertFalse(again["removed"])
         self.cfg["enabled"] = False
         with self.assertRaises(ValueError):
-            self.submit()
-        self.tick(3)
-        self.assertEqual(self.qb.calls, [])
-        self.cfg["enabled"] = True
-        job = self.job(infohash)
-        job["seed_after_check"] = False
-        self.store.save(job)
-        self.checking(infohash)
-        self.qb.finish(infohash)
-        self.tick(2)
-        self.assertEqual(self.job(infohash)["status"], "completed")
-        self.assertEqual(self.qb.rows[infohash]["state"], "stoppedUP")
+            self.d.submit({"category": "radarr", "urls": "magnet:?xt=urn:btih:" + "e" * 40})
 
-    def test_errors_are_bounded_safe_and_failed_jobs_need_explicit_retry(self):
-        infohash = self.submit()
-        self.tick(3)
-        self.cloud.offline = lambda _: (_ for _ in ()).throw(UpstreamError("CD2 ListOfflineFilesByPath：gRPC 7"))
-        self.tick(3)
-        job = self.job(infohash)
-        self.assertEqual(job["status"], "failed")
-        self.assertIn("ListOfflineFilesByPath", job["message"])
-        self.assertIn("7", job["message"])
-        self.assertEqual(self.submit(), infohash)
-        self.assertEqual(self.job(infohash)["status"], "failed")
-        self.d.retry(infohash)
-        self.assertNotEqual(self.job(infohash)["status"], "failed")
-        self.cloud.offline = lambda _: (_ for _ in ()).throw(ConnectionError("DO-NOT-EXPOSE-TOKEN"))
-        self.tick(3)
-        self.assertNotIn("DO-NOT", json.dumps(self.job(infohash)))
+    def test_trackers_can_be_withheld(self):
+        self.cfg["send_trackers"] = False
+        job = self.d.submit({"category": "radarr"}, torrent())
+        self.assertNotIn("tr=", job["magnet"])
+        self.assertIn("dn=", job["magnet"])
 
-    def test_identity_path_or_file_selection_change_never_starts(self):
-        infohash = self.submit()
-        self.tick(3)
-        self.qb.rows[infohash]["save_path"] = "/elsewhere"
-        self.tick()
-        self.assertEqual(self.job(infohash)["status"], "failed")
-        self.assertEqual(self.cloud.calls, [])
-
-    def test_stop_then_resume_magnet_recreates_metadata_stop_condition(self):
-        infohash = metainfo(torrent())["hash"]
-        self.d.submit({"category": "radarr", "urls": offline_magnet(infohash)})
-        self.tick(3)
-        self.d.control([infohash], "stop")
-        self.d.control([infohash], "start")
-        self.tick(4)
-        self.assertEqual(self.job(infohash)["phase"], "metadata")
-        self.assertEqual(len([c for c in self.qb.calls if c[0] == "add"]), 2)
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
-        self.assertEqual(self.cloud.calls, [])
-
-    def test_no_check_evidence_never_becomes_completed(self):
-        infohash = self.submit()
-        self.checking(infohash)
-        self.qb.post = lambda path, **params: b""  # Recheck is acknowledged but never runs.
-        self.qb.rows[infohash].update(state="stoppedDL", progress=0)
-        self.tick(5)
-        self.assertEqual(self.job(infohash)["status"], "failed")
-        self.assertNotEqual(self.d.overlay(self.qb.get("torrents/info"))[0]["progress"], 1)
-
-    def test_share_limits_preserved_and_torrent_selection_change_fails(self):
-        infohash = self.d.submit({"category": "radarr", "ratioLimit": "2.5", "seedingTimeLimit": "120"}, torrent())["hash"]
-        self.assertEqual(self.job(infohash)["share_limits"], {"ratioLimit": "2.5", "seedingTimeLimit": "120"})
-        self.tick(3)
-        self.qb.manifests[infohash][1]["priority"] = 0
-        self.tick()
-        self.assertEqual(self.job(infohash)["status"], "failed")
-        self.assertEqual(self.cloud.calls, [])
-
-    def test_http_arr_login_submit_queue_status_and_guarded_mutations(self):
-        server = Server(self.d)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        base = f"http://127.0.0.1:{server.server_port}"
-        opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
-
-        def request(path, data=None, typ="application/x-www-form-urlencoded"):
-            with opener.open(Request(base + path, data=data, headers={"Content-Type": typ}), timeout=5) as response:
-                return response.read()
-
-        with self.assertRaises(HTTPError) as denied:
-            request("/api/v2/torrents/info")
-        self.assertEqual(denied.exception.code, 403)
-        denied.exception.close()
-        self.assertEqual(request("/api/v2/auth/login", urlencode({"username": "arr", "password": "bad"}).encode()), b"Fails.")
-        self.assertEqual(request("/api/v2/auth/login", urlencode({"username": "arr", "password": self.cfg["password"]}).encode()), b"Ok.")
-        body, typ = multipart({"category": "radarr"}, torrent())
-        self.assertEqual(request("/api/v2/torrents/add", body, typ), b"Ok.")
-        rows = json.loads(request("/api/v2/torrents/info?category=radarr"))
-        self.assertEqual(len(rows), 1)
-        self.assertLess(rows[0]["progress"], 1)
-        infohash = rows[0]["hash"]
-        properties = json.loads(request("/api/v2/torrents/properties?hash=" + infohash))
-        self.assertEqual(properties["total_size"], 24)
-        self.assertEqual(properties["completion_date"], -1)
-        self.assertEqual(json.loads(request("/api/v2/torrents/files?hash=" + infohash)), [])
-        self.assertEqual(json.loads(request("/api/v2/torrents/info?category=other")), [])
-        self.assertEqual(json.loads(request("/api/v2/torrents/info?filter=completed")), [])
-        self.assertNotIn(b"MUST-NOT-LEAK", request("/api/v2/app/preferences"))
-        self.assertEqual(json.loads(request("/v1/downloads/" + infohash))["status"], "new")
-        with self.assertRaises(HTTPError) as invalid:
-            request("/api/v2/torrents/delete", urlencode({"hashes": infohash, "deleteFiles": "true"}).encode())
-        self.assertEqual(invalid.exception.code, 400)
-        invalid.exception.close()
-        with self.assertRaises(HTTPError) as forbidden:
-            request("/api/v2/app/setPreferences", b"json={}")
-        self.assertEqual(forbidden.exception.code, 405)
-        forbidden.exception.close()
-
-    def test_failed_task_keeps_phase_and_restart_timeout_never_resumes(self):
-        infohash = self.submit()
-        self.tick(4)
-        self.now += self.cfg["timeout_seconds"] + 1
-        self.tick()
-        self.assertEqual(self.job(infohash)["status"], "failed")
-        self.assertEqual(self.job(infohash)["phase"], "offline")
-        requested = self.job(infohash)["offline_requested"]
-        self.d.retry(infohash)
-        self.assertEqual(self.job(infohash)["offline_requested"], requested)
-        self.assertFalse(any(c[0] == "torrents/start" for c in self.qb.calls))
-
-    def test_http_parallel_delivery_files_and_cleanup_do_not_change_real_qb(self):
-        self.cfg["import_after"] = "cloud_ready"
-        infohash = self.submit()
-        self.checking(infohash)
-        server = Server(self.d)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        base = f"http://127.0.0.1:{server.server_port}"
-        opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
-
-        def request(path, values=None):
-            data = urlencode(values).encode() if values is not None else None
-            with opener.open(Request(base + path, data=data), timeout=5) as response:
-                return response.read()
-
-        request("/api/v2/auth/login", {"username": "arr", "password": self.cfg["password"]})
-        rows = json.loads(request("/api/v2/torrents/info?filter=completed"))
-        self.assertEqual([row["hash"] for row in rows], [infohash])
-        files = json.loads(request("/api/v2/torrents/files?hash=" + infohash))
-        self.assertTrue(all(f["progress"] == 1 for f in files))
-        properties = json.loads(request("/api/v2/torrents/properties?hash=" + infohash))
-        self.assertGreater(properties["completion_date"], 0)
-        self.assertTrue(all(f["progress"] == 0 for f in self.qb.manifests[infohash]))
-        with self.assertRaises(HTTPError) as invalid:
-            request("/api/v2/torrents/delete", {"hashes": infohash, "deleteFiles": "true"})
-        self.assertEqual(invalid.exception.code, 400)
-        invalid.exception.close()
-        request("/api/v2/torrents/delete", {"hashes": infohash, "deleteFiles": "false"})
-        self.assertEqual(json.loads(request("/api/v2/torrents/info")), [])
-        self.assertEqual(self.qb.rows[infohash]["state"], "checkingDL")
-        with self.assertRaises(HTTPError) as removed:
-            request("/api/v2/torrents/files?hash=" + infohash)
-        self.assertEqual(removed.exception.code, 404)
-        removed.exception.close()
-        public = json.loads(request("/v1/downloads/" + infohash))
-        self.assertEqual(public["delivery_status"], "removed")
-        self.assertEqual(public["seeding_status"], "checking")
+    def test_completeness_rules(self):
+        job = {"files": [{"path": "a/x.mkv", "size": 2 * MB}, {"path": "a/x.mkv.nfo", "size": 10}]}
+        self.assertTrue(complete(job, {"x.mkv": cloud_file("/f/x.mkv", 2 * MB)}))
+        self.assertFalse(complete(job, {"x.mkv": cloud_file("/f/x.mkv", MB)}))
+        self.assertFalse(complete(job, {"x.mkv": {**cloud_file("/f/x.mkv", 2 * MB), "local": True}}))
+        self.assertFalse(complete({"size": 10 * MB}, {"x.mkv": cloud_file("/f/x.mkv", 2 * MB)}))
+        self.assertTrue(complete({"size": 0}, {"x.mkv": cloud_file("/f/x.mkv", 1)}))
+        self.assertFalse(complete({"size": 0}, {}))
 
 
 class MetadataTests(unittest.TestCase):
-    def test_original_info_hash_and_manifest(self):
+    def test_original_info_hash_trackers_and_padding(self):
         meta = metainfo(torrent())
-        self.assertEqual(meta["size"], 24)
-        self.assertEqual(len(meta["files"]), 2)
+        self.assertEqual(meta["size"], 3 * MB + 4)
         self.assertEqual(meta["name"], "Show & 电影")
         raw_info = torrent().split(b"4:info", 1)[1][:-1]
         self.assertEqual(meta["hash"], hashlib.sha1(raw_info).hexdigest())
+        self.assertEqual(meta["trackers"], ["https://tracker.example/announce", "udp://open.example:1337"])
         encoded = base64.b32encode(bytes.fromhex(meta["hash"])).decode()
         self.assertEqual(magnet("magnet:?xt=urn:btih:" + encoded), meta["hash"])
-        self.assertEqual(magnet(offline_magnet(meta["hash"])), meta["hash"])
+        rebuilt = offline_magnet(meta["hash"], meta["name"], meta["trackers"])
+        self.assertEqual(magnet(rebuilt), meta["hash"])
+        self.assertEqual(magnet_parts(rebuilt), (meta["name"], meta["trackers"]))
+        padded = metainfo(torrent(padding=True))
+        self.assertEqual([f["path"] for f in padded["files"]], ["Show & 电影/Show.S01E01.mkv", "Show & 电影/release.nfo"])
+        self.assertEqual(metainfo(torrent(private=True), allow_private=True)["trackers"], [])
 
-    def test_private_v2_path_traversal_duplicates_and_invalid_hashes_rejected(self):
+    def test_private_v2_path_traversal_and_invalid_hashes_rejected(self):
         with self.assertRaises(ValueError):
             metainfo(torrent(True))
         for raw in (b"d4:infoi1ee", b"d4:infode4:infodee", torrent() + b"x", b"d4:info"):
@@ -605,111 +391,130 @@ class MetadataTests(unittest.TestCase):
         info = {b"name": b"show", b"piece length": 16, b"pieces": b"p" * 20, b"length": 1, b"meta version": 2}
         with self.assertRaises(ValueError):
             metainfo(bencode({b"info": info}))
-        del info[b"meta version"]
-        info[b"pieces"] = b"wrong"
-        with self.assertRaises(ValueError):
-            metainfo(bencode({b"info": info}))
 
-    def test_qb_514_wire_options_metadata_stop_and_full_check(self):
-        qb = QB(config()["qb"])
-        meta = metainfo(torrent())
-        job = {"hash": meta["hash"], "qb_path": "/downloads/.arr-offline/" + meta["hash"],
-               "category": "radarr", "tag": "arr-offline-" + meta["hash"], "magnet": offline_magnet(meta["hash"])}
-        calls = []
 
-        def raw(path, data=None, typ=None):
-            if path == "/api/v2/app/version":
-                return b"v5.1.4", "text/plain"
-            values, file = form(data, typ)
-            calls.append((values, file))
-            return b"Ok.", "text/plain"
-
-        with patch.object(qb, "raw", side_effect=raw):
-            qb.add(job, torrent())
-            qb.add(job)
-        self.assertEqual(calls[0][0]["stopped"], "true")
-        self.assertEqual(calls[0][0]["stopCondition"], "FilesChecked")
-        self.assertEqual(calls[0][1], torrent())
-        self.assertEqual(calls[1][0]["stopCondition"], "MetadataReceived")
-        for values, _ in calls:
-            self.assertEqual(values["skip_checking"], "false")
-            self.assertEqual(values["autoTMM"], "false")
-            self.assertEqual(values["useDownloadPath"], "false")
-
-    def test_cd2_safe_interface_and_status_without_upstream_secret(self):
+class CloudWireTests(unittest.TestCase):
+    def test_offline_list_decodes_double_progress_and_errors_are_redacted(self):
+        task = (text_field(1, "Movie") + number(2, 5 * MB) + number(4, 1) + text_field(5, "AB" * 20)
+                + varint(9 << 3 | 1) + struct.pack("<d", 42.5) + number(10, 7))
+        reply = varint(1 << 3 | 2) + varint(len(task)) + task
+        cloud = OfflineCloud.__new__(OfflineCloud)
+        with patch("bridge.arr_import.cloud.Cloud.rpc", return_value=[reply]):
+            row = cloud.offline("/115open/pt/download/x")[0]
+        self.assertEqual((row["hash"], row["status"], row["percent"], row["peers"], row["size"]),
+                         ("ab" * 20, 1, 42.5, 7, 5 * MB))
         cloud = OfflineCloud(config()["cloud"])
         with patch.object(cloud.client, "open", side_effect=ConnectionError("CloudDrive gRPC 状态 7；SECRET-TOKEN")):
             with self.assertRaises(UpstreamError) as failure:
                 cloud.offline("/115open/pt/download")
-        self.assertIn("ListOfflineFilesByPath", str(failure.exception))
-        self.assertIn("7", str(failure.exception))
+        self.assertIn("gRPC 7", str(failure.exception))
         self.assertNotIn("SECRET", str(failure.exception))
         with patch.object(cloud.client, "open", side_effect=ConnectionError("CloudDrive gRPC 状态 5")):
             self.assertIsNone(cloud.get_file("/115open/missing/file.mkv"))
-        body, typ = multipart({"category": "radarr"}, torrent())
-        with self.assertRaises(ValueError):
-            form(body.replace(b'name="category"', b'name="torrents"'), typ)
+            self.assertIsNone(cloud.walk("/115open/missing"))
 
-    def test_qb_actual_http_auth_cookie_origin_and_upstream_error_redaction(self):
-        logins = []
-        origins = []
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
+class HttpTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.d.thread = threading.current_thread()  # healthz: the worker is not started in tests
+        self.server = Server(self.d)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
-            def do_POST(self):
-                self.rfile.read(int(self.headers["Content-Length"]))
-                logins.append(self.path)
-                self.send_response(200)
-                self.send_header("Set-Cookie", "SID=test-qb-session; Path=/")
-                self.end_headers()
-                self.wfile.write(b"Ok.")
+    def call(self, path, data=None, content_type="application/x-www-form-urlencoded"):
+        if isinstance(data, dict):
+            data = urlencode(data).encode()
+        req = Request(self.url + path, data=data, headers={"Content-Type": content_type})
+        with self.opener.open(req, timeout=5) as response:
+            body = response.read()
+        try:
+            return json.loads(body)
+        except ValueError:
+            return body
 
-            def do_GET(self):
-                origins.append(self.headers.get("Origin"))
-                valid = self.headers.get("Cookie") == "SID=test-qb-session"
-                status = 200 if valid and self.path.endswith("version") else 500
-                self.send_response(status)
-                self.end_headers()
-                self.wfile.write(b"v5.1.4" if status == 200 else b"DO-NOT-EXPOSE-TOKEN")
+    def login(self):
+        self.assertEqual(self.call("/api/v2/auth/login", {"username": "arr", "password": self.cfg["password"]}), b"Ok.")
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        url = f"http://127.0.0.1:{server.server_port}"
-        qb = QB({"url": url, "username": "admin", "password": "fixture-password"})
-        self.assertEqual(qb.raw("/api/v2/app/version")[0], b"v5.1.4")
-        self.assertEqual(qb.raw("/api/v2/app/version")[0], b"v5.1.4")
-        self.assertEqual(len(logins), 1)
-        self.assertEqual(origins, [url, url])
-        with self.assertRaises(UpstreamError) as failure:
-            qb.raw("/api/v2/failure")
-        self.assertIn("500", str(failure.exception))
-        self.assertNotIn("DO-NOT", str(failure.exception))
+    def test_arr_flow_over_http(self):
+        with self.assertRaises(HTTPError) as denied:
+            self.call("/api/v2/torrents/info")
+        self.assertEqual(denied.exception.code, 403)
+        self.assertEqual(self.call("/api/v2/auth/login", {"username": "arr", "password": "wrong"}), b"Fails.")
+        self.login()
+        self.assertEqual(self.call("/api/v2/app/webapiVersion"), b"2.11.4")
+        self.assertEqual(self.call("/api/v2/app/version"), b"v5.1.4")
+        preferences = self.call("/api/v2/app/preferences")
+        self.assertTrue(preferences["dht"])
+        self.assertFalse(preferences["queueing_enabled"])
+        self.assertEqual(self.call("/api/v2/torrents/categories")["radarr"]["savePath"], "/downloads")
+        boundary = "x" * 16
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"category\"\r\n\r\nradarr\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"torrents\"; filename=\"a.torrent\"\r\n"
+                "Content-Type: application/x-bittorrent\r\n\r\n").encode() + torrent() + f"\r\n--{boundary}--\r\n".encode()
+        self.assertEqual(self.call("/api/v2/torrents/add", body, "multipart/form-data; boundary=" + boundary), b"Ok.")
+        with self.assertRaises(HTTPError) as duplicate:
+            self.call("/api/v2/torrents/add", body, "multipart/form-data; boundary=" + boundary)
+        self.assertEqual(duplicate.exception.code, 409)
+        infohash = metainfo(torrent())["hash"]
+        properties = self.call("/api/v2/torrents/properties?hash=" + infohash.upper())
+        self.assertEqual(properties["save_path"], "/downloads/.arr-offline/" + infohash)
+        rows = self.call("/api/v2/torrents/info?category=radarr")
+        self.assertEqual([(r["hash"], r["state"]) for r in rows], [(infohash, "metaDL")])
+        self.assertEqual(self.call("/api/v2/torrents/info?category=sonarr"), [])
+        with self.assertRaises(HTTPError) as top:
+            self.call("/api/v2/torrents/topPrio", {"hashes": infohash})
+        self.assertEqual(top.exception.code, 409)
+        self.assertEqual(self.call("/api/v2/torrents/setShareLimits", {"hashes": infohash, "ratioLimit": "1"}), b"")
+        self.assertEqual(self.call("/api/v2/torrents/createCategory", {"category": "radarr-imported"}), b"")
+        self.assertIn("radarr-imported", self.call("/api/v2/torrents/categories"))
+        self.assertEqual(self.call("/v1/downloads/" + infohash)["status"], "queued")
+        self.assertEqual(self.call("/api/v2/torrents/delete", {"hashes": infohash, "deleteFiles": "true"}), b"")
+        self.assertEqual(self.call("/api/v2/torrents/info"), [])
+        with self.assertRaises(HTTPError) as missing:
+            self.call("/api/v2/torrents/properties?hash=" + infohash)
+        self.assertEqual(missing.exception.code, 404)
 
-    def test_configuration_explicit_switches_and_account_boundary(self):
+    def test_bearer_password_and_validation_errors(self):
+        req = Request(self.url + "/api/v2/torrents/info", headers={"Authorization": "Bearer " + self.cfg["password"]})
+        with build_opener().open(req, timeout=5) as response:
+            self.assertEqual(json.loads(response.read()), [])
+        self.login()
+        with self.assertRaises(HTTPError) as bad:
+            self.call("/api/v2/torrents/add", {"category": "radarr", "urls": "https://example/a.torrent"})
+        self.assertEqual(bad.exception.code, 400)
+        with self.assertRaises(HTTPError) as unknown:
+            self.call("/api/v2/torrents/setLocation", {"hashes": "a" * 40, "location": "/x"})
+        self.assertEqual(unknown.exception.code, 405)
+        self.assertEqual(self.call("/healthz"), {"ok": True})
+
+
+class ConfigTests(unittest.TestCase):
+    def test_old_key_names_are_accepted_and_retired_keys_reported(self):
         cfg = config()
-        cfg["port"] = 8097
+        for key in ("retired_keys", "send_trackers", "delete_files"):
+            del cfg[key]
+        cfg["qb_download_root"] = cfg.pop("arr_download_root")
+        cfg["offline_categories"] = cfg.pop("categories")
+        cfg.update(qb={"url": "http://qb:8080"}, seed_after_check=False, import_after="cloud_ready", port=8097)
         with tempfile.TemporaryDirectory() as directory:
             p = Path(directory) / "config.json"
             p.write_text(json.dumps(cfg))
             loaded = load(p)
-            self.assertTrue(loaded["seed_after_check"])
-            self.assertEqual(loaded["import_after"], "qb_checked")
-            cfg["import_after"] = "cloud_ready"
-            p.write_text(json.dumps(cfg))
-            self.assertEqual(load(p)["import_after"], "cloud_ready")
-            cfg["import_after"] = "invalid"
-            p.write_text(json.dumps(cfg))
-            with self.assertRaises(ValueError):
-                load(p)
-            cfg["import_after"] = "qb_checked"
-            cfg["cloud_download_root"] = "/another-account/download"
-            p.write_text(json.dumps(cfg))
-            with self.assertRaises(ValueError):
-                load(p)
+            self.assertEqual(loaded["arr_download_root"], "/downloads")
+            self.assertEqual(loaded["categories"], ["radarr", "sonarr"])
+            self.assertEqual(loaded["retired_keys"], ["import_after", "qb", "seed_after_check"])
+            self.assertTrue(loaded["send_trackers"])
+            self.assertFalse(loaded["delete_files"])
+            for change in ({"cloud_download_root": "/another-account/download"},
+                           {"arr": [{"category": "unknown", "url": "http://r", "api_key": "k"}]},
+                           {"password": "short"}):
+                p.write_text(json.dumps({**cfg, **change}))
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    load(p)
 
 
 if __name__ == "__main__":

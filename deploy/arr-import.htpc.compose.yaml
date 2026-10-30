@@ -1,6 +1,6 @@
 # Overlay for the existing HTPC Compose stack; do not use this file alone.
 # docker compose --env-file /data/env/htpc.env -f /path/to/htpc.yaml \
-#   -f deploy/arr-import.htpc.compose.yaml up -d arr-import radarr sonarr
+#   -f deploy/arr-import.htpc.compose.yaml up -d arr-import arr-download radarr sonarr
 services:
   arr-import:
     image: ${ARR_IMPORT_IMAGE:-ghcr.io/ayanamimcy/autosync-symlink:edge}
@@ -35,6 +35,42 @@ services:
     stop_grace_period: 90s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8096/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+
+  arr-download:
+    image: ${ARR_IMPORT_IMAGE:-ghcr.io/ayanamimcy/autosync-symlink:edge}
+    entrypoint: ["python", "-m", "bridge.arr_download"]
+    command: ["--config", "/settings/arr-download.json", "--data-dir", "/data"]
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      TZ: "${TZ:-Asia/Tokyo}"
+      ARR_DOWNLOAD_PASSWORD: "${ARR_DOWNLOAD_PASSWORD:?需要设置下载代理密码}"
+      CD2_DOWNLOAD_TOKEN: "${CD2_DOWNLOAD_TOKEN:?需要设置CD2令牌}"
+      RADARR_API_KEY: "${RADARR_API_KEY:-}"
+      SONARR_API_KEY: "${SONARR_API_KEY:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: "${CONFIGS:?需要设置CONFIGS}/arr-download/arr-download.json"
+        target: /settings/arr-download.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${CONFIGS:?需要设置CONFIGS}/arr-download/data"
+        target: /data
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    stop_grace_period: 70s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8097/healthz', timeout=3).read()"]
       interval: 30s
       timeout: 5s
 

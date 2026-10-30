@@ -1,3 +1,4 @@
+"""The subset of the qBittorrent v2 Web API that Radarr and Sonarr use."""
 import email.parser
 import email.policy
 import hmac
@@ -8,21 +9,17 @@ import re
 import secrets
 import threading
 import time
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from bridge.config import secret
 from .clients import UpstreamError
 from .metadata import MAX_META
-from .read_cache import AppReadCache
-from .service import deliverable
 
-READS = {"app/version", "app/webapiVersion", "app/preferences", "torrents/properties",
-         "torrents/files", "torrents/trackers", "torrents/categories", "torrents/tags", "transfer/info"}
-WRITES = {"torrents/start", "torrents/stop", "torrents/resume", "torrents/pause", "torrents/delete",
-          "torrents/recheck", "torrents/setShareLimits", "torrents/setCategory", "torrents/createCategory"}
-PREFERENCES = {"save_path", "temp_path_enabled", "temp_path", "max_ratio_act", "max_ratio_enabled",
-               "max_ratio", "max_seeding_time_enabled", "max_seeding_time", "queueing_enabled",
-               "max_active_downloads", "max_active_torrents", "max_active_uploads"}
+VERSION, WEBAPI_VERSION = b"v5.1.4", b"2.11.4"
+# Accepted and ignored: there is no queue, seeding or piece selection behind 115 offline.
+NOOPS = {"torrents/start", "torrents/stop", "torrents/resume", "torrents/pause", "torrents/setShareLimits",
+         "torrents/setForceStart", "torrents/addTags", "torrents/removeTags", "torrents/recheck",
+         "torrents/reannounce", "torrents/bottomPrio", "torrents/increasePrio", "torrents/decreasePrio"}
 
 
 def form(body, content_type):
@@ -62,12 +59,11 @@ class Server(ThreadingHTTPServer):
     def __init__(self, downloader):
         self.downloader = downloader
         self.sessions, self.session_lock = {}, threading.RLock()
-        self.app_cache = AppReadCache(wait_seconds=downloader.config["qb"].get("timeout_seconds", 15) + 2)
         super().__init__((downloader.config["host"], downloader.config["port"]), Handler)
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ArrDownload/1.0"
+    server_version = "ArrDownload/2.0"
     sys_version = ""
 
     def setup(self):
@@ -77,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, status, body, content_type="application/json", cookie=None, headers=None):
+    def reply(self, status, body, content_type="application/json", cookie=None):
         if not isinstance(body, bytes):
             body = json.dumps(body, ensure_ascii=False).encode()
         self.send_response(status)
@@ -86,29 +82,157 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         if cookie:
             self.send_header("Set-Cookie", cookie)
-        for key, value in (headers or {}).items():
-            self.send_header(key, value)
         self.end_headers()
         try:
             self.wfile.write(body)
         except (OSError, TimeoutError):
             pass
 
-    def session(self):
+    def text(self, body=b"Ok."):
+        self.reply(200, body, "text/plain; charset=UTF-8")
+
+    def authorized(self):
+        password = secret(self.server.downloader.config["password"]).encode()
+        bearer = self.headers.get("Authorization", "")
+        if bearer.startswith("Bearer ") and hmac.compare_digest(bearer[7:].encode(), password):
+            return True
         cookie = SimpleCookie()
-        cookie.load(self.headers.get("Cookie", ""))
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return False
         sid = cookie.get("SID")
         now = time.monotonic()
         with self.server.session_lock:
             self.server.sessions = {k: v for k, v in self.server.sessions.items() if v > now}
-            return sid.value if sid and sid.value in self.server.sessions else None
+            return bool(sid and sid.value in self.server.sessions)
+
+    def login(self, values):
+        config = self.server.downloader.config
+        if (not hmac.compare_digest(values.get("username", "").encode(), config["username"].encode())
+                or not hmac.compare_digest(values.get("password", "").encode(), secret(config["password"]).encode())):
+            self.text(b"Fails.")
+            return
+        sid = secrets.token_hex(32)
+        with self.server.session_lock:
+            now = time.monotonic()
+            self.server.sessions = {k: v for k, v in self.server.sessions.items() if v > now}
+            if len(self.server.sessions) >= 1000:
+                self.reply(503, {"error": "会话已满"})
+                return
+            self.server.sessions[sid] = now + 3600
+        self.reply(200, b"Ok.", "text/plain; charset=UTF-8", "SID=" + sid + "; Path=/; HttpOnly; SameSite=Strict")
+
+    def hashes(self, value):
+        d = self.server.downloader
+        if value == "all":
+            return [j["hash"] for j in d.store.all()]
+        hashes = [h.lower() for h in value.split("|") if h]
+        if not hashes or any(not re.fullmatch(r"[a-f0-9]{40}", h) for h in hashes):
+            raise ValueError("必须指定有效的 hashes")
+        return hashes
+
+    def job(self, query):
+        job = self.server.downloader.store.get(query.get("hash", [""])[0].lower())
+        return job if job and not job.get("removed") else None
+
+    def categories(self):
+        d = self.server.downloader
+        names = set(d.config["categories"]) | d.extra_categories | {j["category"] for j in d.store.all()}
+        return {n: {"name": n, "savePath": d.config["arr_download_root"]} for n in sorted(names)}
+
+    def get(self, path, query):
+        d = self.server.downloader
+        if path == "app/version":
+            self.text(VERSION)
+        elif path == "app/webapiVersion":
+            self.text(WEBAPI_VERSION)
+        elif path == "app/preferences":
+            self.reply(200, {"save_path": d.config["arr_download_root"], "temp_path_enabled": False, "dht": True,
+                             "max_ratio_enabled": False, "max_ratio": -1, "max_seeding_time_enabled": False,
+                             "max_seeding_time": -1, "max_inactive_seeding_time_enabled": False,
+                             "max_inactive_seeding_time": -1, "max_ratio_act": 0, "queueing_enabled": False})
+        elif path == "transfer/info":
+            self.reply(200, {"connection_status": "connected", "dl_info_speed": 0, "up_info_speed": 0,
+                             "dl_info_data": 0, "up_info_data": 0, "dht_nodes": 0})
+        elif path == "torrents/categories":
+            self.reply(200, self.categories())
+        elif path == "torrents/tags":
+            self.reply(200, sorted({t.strip() for j in d.store.all() for t in j.get("tags", "").split(",") if t.strip()}))
+        elif path == "torrents/info":
+            category = query.get("category", [None])[0]
+            hashes = query.get("hashes", [None])[0]
+            rows = d.rows(category, set(self.hashes(hashes)) if hashes else None)
+            selected = query.get("filter", ["all"])[0]
+            if selected in ("completed", "seeding", "stopped", "paused"):
+                rows = [r for r in rows if r["state"] == "stoppedUP"]
+            elif selected in ("downloading", "active", "running", "resumed"):
+                rows = [r for r in rows if r["state"] != "stoppedUP"]
+            elif selected == "errored":
+                rows = [r for r in rows if r["state"] == "error"]
+            if "sort" in query and query["sort"][0] in ("name", "hash", "added_on", "progress", "size"):
+                key = query["sort"][0]
+                rows.sort(key=lambda r: r[key], reverse=query.get("reverse", ["false"])[0] == "true")
+            offset, limit = int(query.get("offset", [0])[0]), int(query.get("limit", [0])[0])
+            self.reply(200, rows[max(offset, 0):max(offset, 0) + limit] if limit > 0 else rows[max(offset, 0):])
+        elif path in ("torrents/properties", "torrents/files", "torrents/trackers"):
+            job = self.job(query)
+            if not job:
+                self.reply(404, {"error": "种子不存在"})
+            elif path == "torrents/properties":
+                self.reply(200, d.properties(job))
+            elif path == "torrents/files":
+                self.reply(200, d.files(job))
+            else:
+                self.reply(200, [])
+        else:
+            self.reply(404, {"error": "该接口不在下载代理支持范围内"})
+
+    def post(self, path, values, torrent):
+        d = self.server.downloader
+        if torrent is not None and path != "torrents/add":
+            raise ValueError("此接口不接受文件")
+        if path == "torrents/add":
+            if torrent is not None and values.get("urls"):
+                raise ValueError("不能同时提交种子文件和 URL")
+            try:
+                d.submit(values, torrent)
+            except FileExistsError:
+                self.reply(409, b"Torrent already exists.", "text/plain; charset=UTF-8")
+                return
+            self.text()
+        elif path == "torrents/delete":
+            d.remove(self.hashes(values.get("hashes", "")), values.get("deleteFiles", "false").lower() in ("true", "1"))
+            self.text(b"")
+        elif path == "torrents/setCategory":
+            category = values.get("category", "")
+            if category and not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", category):
+                raise ValueError("分类名称无效")
+            d.set_category(self.hashes(values.get("hashes", "")), category)
+            self.text(b"")
+        elif path == "torrents/createCategory":
+            category = values.get("category", "")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", category):
+                raise ValueError("分类名称无效")
+            d.extra_categories.add(category)
+            self.text(b"")
+        elif path == "torrents/topPrio":
+            # Same reply as qB with queueing disabled; Arr ignores 409 here.
+            self.reply(409, b"Torrent queueing must be enabled", "text/plain; charset=UTF-8")
+        elif path in NOOPS:
+            self.text(b"")
+        else:
+            self.reply(405, {"error": "该接口不在下载代理支持范围内"})
 
     def dispatch(self, post=False):
         d = self.server.downloader
         url = urlsplit(self.path)
-        path = url.path.removeprefix("/api/v2/")
         try:
-            body = b""
+            if not post and url.path == "/healthz":
+                healthy = bool(d.thread and d.thread.is_alive())
+                self.reply(200 if healthy else 503, {"ok": healthy})
+                return
+            values, torrent = {}, None
             if post:
                 if self.headers.get("Transfer-Encoding"):
                     raise ValueError("不支持分块请求")
@@ -118,47 +242,28 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.rfile.read(size)
                 if len(body) != size:
                     raise ValueError("请求体截断")
-            if not post and url.path == "/healthz":
-                healthy = bool(d.thread and d.thread.is_alive())
-                self.reply(200 if healthy else 503, {"ok": healthy})
-                return
-            content_type = self.headers.get("Content-Type", "application/x-www-form-urlencoded")
+                if body:
+                    values, torrent = form(body, self.headers.get("Content-Type", "application/x-www-form-urlencoded"))
             if post and url.path == "/api/v2/auth/login":
-                values, _ = form(body, content_type)
-                if (not hmac.compare_digest(values.get("username", "").encode(), d.config["username"].encode())
-                        or not hmac.compare_digest(values.get("password", "").encode(), secret(d.config["password"]).encode())):
-                    self.reply(200, b"Fails.", "text/plain")
-                    return
-                sid = secrets.token_hex(32)
-                with self.server.session_lock:
-                    now = time.monotonic()
-                    self.server.sessions = {k: v for k, v in self.server.sessions.items() if v > now}
-                    if len(self.server.sessions) >= 1000:
-                        self.reply(503, {"error": "会话已满"})
-                        return
-                    self.server.sessions[sid] = now + 3600
-                self.reply(200, b"Ok.", "text/plain", "SID=" + sid + "; Path=/; HttpOnly; SameSite=Strict")
+                self.login(values)
                 return
-            sid = self.session()
-            if not sid:
-                self.reply(403, {"error": "需要登录下载代理"})
+            if not self.authorized():
+                self.reply(403, b"Forbidden", "text/plain; charset=UTF-8")
                 return
-            if post and url.path == "/api/v2/auth/logout":
-                with self.server.session_lock:
-                    self.server.sessions.pop(sid, None)
+            query = parse_qs(url.query, keep_blank_values=True, max_num_fields=100)
+            if url.path == "/api/v2/auth/logout":
                 self.reply(200, b"", "text/plain", "SID=; Path=/; Max-Age=0")
                 return
-            if not post and url.path == "/v1/diagnostics":
-                self.reply(200, {"qb": d.qb.diagnostics(), "app_cache": self.server.app_cache.diagnostics()})
+            if not post and url.path == "/v1/downloads":
+                self.reply(200, [d.public(j) for j in d.store.all()])
                 return
-            job_route = re.fullmatch(r"/v1/downloads/([a-f0-9]{40})(/retry)?", url.path)
-            if job_route:
-                infohash, retry = job_route.groups()
+            route = re.fullmatch(r"/v1/downloads/([a-f0-9]{40})(/retry)?", url.path)
+            if route:
+                infohash, retry = route.groups()
+                job = d.store.get(infohash)
                 if post != bool(retry):
                     self.reply(405, {"error": "请求方法不匹配"})
-                    return
-                job = d.store.get(infohash)
-                if not job:
+                elif not job:
                     self.reply(404, {"error": "任务不存在"})
                 else:
                     self.reply(200, d.retry(infohash) if retry else d.public(job))
@@ -166,131 +271,18 @@ class Handler(BaseHTTPRequestHandler):
             if not url.path.startswith("/api/v2/"):
                 self.reply(404, {"error": "接口不存在"})
                 return
-            if post and path == "torrents/add":
-                values, torrent = form(body, content_type)
-                if torrent is not None and values.get("urls"):
-                    raise ValueError("不能同时提交种子文件和 URL")
-                job = d.submit(values, torrent)
-                if job is None:
-                    payload, typ = d.qb.raw(url.path, body, content_type)
-                    self.reply(200, payload, typ)
-                else:
-                    self.reply(200, b"Ok.", "text/plain")
-                return
-            if not post and path == "torrents/info":
-                query = parse_qs(url.query, keep_blank_values=True, max_num_fields=100)
-                category = query.get("category", [None])[0]
-                hashes = query.get("hashes", [None])[0]
-                hashes = set(hashes.split("|")) if hashes else None
-                rows = d.qb.get("torrents/info")
-                if category is not None:
-                    rows = [row for row in rows if row.get("category") == category]
-                if hashes is not None:
-                    rows = [row for row in rows if row["hash"] in hashes]
-                rows = d.overlay(rows, category, hashes)
-                filter_name = query.get("filter", ["all"])[0]
-                if filter_name in ("seeding", "completed"):
-                    rows = [row for row in rows if row.get("progress") == 1]
-                elif filter_name == "downloading":
-                    rows = [row for row in rows if row.get("progress", 0) < 1]
-                elif filter_name not in ("all", ""):
-                    raise ValueError("第一版只支持 all/downloading/completed/seeding 过滤")
-                if "sort" in query:
-                    key = query["sort"][0]
-                    if key not in ("name", "hash", "added_on", "progress", "size"):
-                        raise ValueError("不支持的排序字段")
-                    rows.sort(key=lambda r: r.get(key, "" if key in ("name", "hash") else 0),
-                              reverse=query.get("reverse", ["false"])[0] == "true")
-                offset, limit = int(query.get("offset", [0])[0]), int(query.get("limit", [0])[0])
-                if offset < 0 or limit < 0:
-                    raise ValueError("分页参数无效")
-                self.reply(200, rows[offset:offset + limit] if limit else rows[offset:])
-                return
-            if not post and path in READS:
-                if path in AppReadCache.POLICIES:
-                    def fetch_app():
-                        payload, typ = d.qb.raw("/api/v2/" + path)
-                        if path == "app/preferences":
-                            # Do not retain qB authentication settings in the cache.
-                            try:
-                                preferences = json.loads(payload)
-                                if not isinstance(preferences, dict):
-                                    raise ValueError()
-                            except (ValueError, UnicodeError):
-                                raise UpstreamError("qB app/preferences 返回无效 JSON 对象") from None
-                            payload = json.dumps({k: v for k, v in preferences.items() if k in PREFERENCES}).encode()
-                            typ = "application/json"
-                        elif not re.fullmatch(rb"v?[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.]+)?", payload.strip()):
-                            raise UpstreamError("qB 版本接口返回无效版本号；未更新缓存")
-                        return payload, typ
-                    payload, typ, status = self.server.app_cache.get(path, fetch_app)
-                    self.reply(200, payload, typ, headers={"X-Arr-App-Cache": status})
-                    return
-                if path in ("torrents/properties", "torrents/files", "torrents/trackers"):
-                    query = parse_qs(url.query, max_num_fields=100)
-                    job = d.store.get(query.get("hash", [""])[0])
-                    if job and job.get("delivery_detached"):
-                        self.reply(404, {"error": "下载交付记录已移除；后台做种任务保留"})
-                        return
-                    if job and job["status"] not in ("completed", "cancelled"):
-                        # Arr checks properties immediately after add, before the worker's first tick.
-                        if path == "torrents/properties":
-                            self.reply(200, {"save_path": job["qb_path"], "total_size": (job.get("meta") or {}).get("size", 0),
-                                             "creation_date": -1, "addition_date": int(job["started"]),
-                                             "completion_date": int(job.get("qb_checked_at") or job.get("cloud_ready_at") or 0) if deliverable(job) else -1,
-                                             "seeding_time": 0, "share_ratio": 0,
-                                             "total_downloaded": 0, "total_uploaded": 0, "pieces_have": 0,
-                                             "comment": job["message"]})
-                            return
-                        if deliverable(job) and path == "torrents/files":
-                            self.reply(200, [{"index": index, "name": f["path"], "size": f["size"],
-                                              "progress": 1, "priority": 1, "is_seed": False}
-                                             for index, f in enumerate(job["meta"]["files"])])
-                            return
-                        if not d.qb.info(job["hash"]):
-                            self.reply(200, [])
-                            return
-                payload, typ = d.qb.raw(url.path + ("?" + url.query if url.query else ""))
-                self.reply(200, payload, typ)
-                return
-            if post and path in WRITES:
-                values, torrent = form(body, content_type)
-                if torrent is not None:
-                    raise ValueError("此接口不接受文件")
-                if path == "torrents/createCategory":
-                    if values.get("category") not in d.config["offline_categories"]:
-                        raise ValueError("只能通过代理创建已配置的离线分类")
-                    if values.get("savePath", "").rstrip("/") not in ("", d.config["qb_download_root"]):
-                        raise ValueError("分类保存路径必须与 qb_download_root 一致")
-                else:
-                    value = values.get("hashes", "")
-                    hashes = value.split("|")
-                    if value == "all":
-                        hashes = list({r["hash"] for r in d.qb.get("torrents/info")} | {j["hash"] for j in d.store.all()})
-                    if not hashes or any(not re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", h) for h in hashes):
-                        raise ValueError("必须指定有效的 hashes")
-                    if path == "torrents/delete" and values.get("deleteFiles", "false").lower() not in ("false", "0"):
-                        if any(d.store.get(h) for h in hashes):
-                            raise ValueError("代理不删除离线做种源文件；仅支持 deleteFiles=false")
-                    action = {"resume": "start", "pause": "stop"}.get(path.split("/")[1], path.split("/")[1])
-                    hashes = d.control(hashes, action)
-                    if not hashes:
-                        self.reply(200, b"", "text/plain")
-                        return
-                    values["hashes"] = "|".join(hashes)
-                    path = "torrents/" + action
-                payload = d.qb.post(path, **values)
-                self.reply(200, payload, "text/plain")
-                return
-            self.reply(404 if not post else 405, {"error": "该接口不在下载代理支持范围内"})
+            path = url.path.removeprefix("/api/v2/")
+            if post:
+                self.post(path, values, torrent)
+            else:
+                self.get(path, query)
         except ValueError as error:
             # Only fixed local validation messages; never stringify arbitrary upstream exceptions.
-            message = str(error) if type(error) is ValueError else "请求编码或内容无效"
-            self.reply(400, {"error": message})
+            self.reply(400, {"error": str(error) if type(error) is ValueError else "请求编码或内容无效"})
         except UpstreamError as error:
             self.reply(503, {"error": str(error)})
         except Exception:
-            self.reply(503, {"error": "下载服务暂不可用；检查任务状态与上游连接"})
+            self.reply(503, {"error": "下载服务暂不可用"})
 
     def do_GET(self):
         self.dispatch()

@@ -1,165 +1,17 @@
-import http.cookiejar
 import json
-import logging
 import re
-import secrets
-import threading
-import time
+import struct
 from urllib.error import HTTPError
-from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, build_opener
+from urllib.parse import urlencode
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from bridge.arr_import.cloud import Cloud, number
+from bridge.arr_import.cloud import Cloud, OperationRejected, number
 from bridge.config import secret
 from bridge.protocol import fields, text_field
 
 
 class UpstreamError(ConnectionError):
     """Only locally generated, credential-free diagnostics are exposed."""
-
-
-def multipart(values, torrent=None):
-    boundary = "arr-" + secrets.token_hex(24)
-    body = bytearray()
-    for key, value in values.items():
-        body.extend((f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n').encode())
-    if torrent is not None:
-        body.extend((f'--{boundary}\r\nContent-Disposition: form-data; name="torrents"; filename="download.torrent"\r\nContent-Type: application/x-bittorrent\r\n\r\n').encode())
-        body.extend(torrent + b"\r\n")
-    body.extend((f"--{boundary}--\r\n").encode())
-    return bytes(body), "multipart/form-data; boundary=" + boundary
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
-class QB:
-    def __init__(self, config):
-        self.config, self.lock = config, threading.RLock()
-        self.cookies = http.cookiejar.CookieJar()
-        self.local = threading.local()
-        self.logged_in = False
-        self.generation = 0
-        self.status_lock = threading.Lock()
-        self.status = {"requests": 0, "failures": 0, "last_success": None, "last_error": None}
-
-    def diagnostics(self):
-        with self.status_lock:
-            return {**self.status}
-
-    def failure(self, path, error):
-        detail = {"endpoint": urlsplit(path).path, "kind": type(error).__name__,
-                  "stage": getattr(error, "arr_stage", "response_headers"),
-                  "seconds": round(getattr(error, "arr_elapsed", 0), 3), "time": time.time()}
-        if isinstance(error, HTTPError):
-            detail["http_status"] = error.code
-        with self.status_lock:
-            self.status["failures"] += 1
-            self.status["last_error"] = detail
-        logging.getLogger(__name__).warning("qB upstream failure: %s", json.dumps(detail))
-        failure = UpstreamError(f"qB {detail['endpoint']} {detail['stage']} 异常（{detail['kind']}，{detail['seconds']} 秒）")
-        if isinstance(error, HTTPError):
-            failure = UpstreamError(f"qB HTTP {error.code}；{detail['endpoint']}")
-        return failure
-
-    def raw(self, path, data=None, content_type="application/x-www-form-urlencoded", method=None):
-        for attempt in range(2):
-            # Serialize authentication only. A slow read must not hold up every
-            # other HTTP handler and the worker through one global network lock.
-            with self.lock:
-                if not self.logged_in:
-                    self.login()
-                generation = self.generation
-            try:
-                return self._raw(path, data, content_type, method)
-            except HTTPError as error:
-                code = error.code
-                error.close()
-                if code in (401, 403) and not attempt:
-                    with self.lock:
-                        if generation == self.generation:
-                            self.logged_in = False
-                    continue
-                raise self.failure(path, error) from None
-            except UpstreamError:
-                raise
-            except Exception as error:
-                # A timeout on a write is ambiguous. Never replay add/start/delete
-                # or other mutations merely because the response was lost.
-                raise self.failure(path, error) from None
-
-    def _raw(self, path, data, content_type, method=None):
-        url = self.config["url"].rstrip("/")
-        origin = urlsplit(url)
-        req = Request(url + path, data=data, method=method,
-                      headers={"Content-Type": content_type, "Referer": url + "/",
-                               "Origin": origin.scheme + "://" + origin.netloc})
-        # Each thread owns its opener/handlers; only the internally locked
-        # CookieJar is shared, so all threads reuse the same authenticated SID.
-        if not hasattr(self.local, "opener"):
-            self.local.opener = build_opener(NoRedirect(), HTTPCookieProcessor(self.cookies))
-        start, stage = time.monotonic(), "response_headers"
-        with self.status_lock:
-            self.status["requests"] += 1
-        try:
-            with self.local.opener.open(req, timeout=self.config.get("timeout_seconds", 15)) as response:
-                stage = "response_body"
-                payload = response.read(16 * 1024 * 1024 + 1)
-                if len(payload) > 16 * 1024 * 1024:
-                    raise UpstreamError("qB 响应过大")
-                result = payload, response.headers.get("Content-Type", "application/json")
-            with self.status_lock:
-                self.status["last_success"] = time.time()
-            return result
-        except Exception as error:
-            error.arr_stage, error.arr_elapsed = stage, time.monotonic() - start
-            raise
-
-    def login(self):
-        data = urlencode({"username": secret(self.config["username"]), "password": secret(self.config["password"])}).encode()
-        try:
-            payload, _ = self._raw("/api/v2/auth/login", data, "application/x-www-form-urlencoded")
-        except Exception as error:
-            if isinstance(error, HTTPError):
-                error.close()
-            raise self.failure("/api/v2/auth/login", error) from None
-        if payload.strip() != b"Ok.":
-            raise UpstreamError("qB 登录失败")
-        self.logged_in = True
-        self.generation += 1
-
-    def get(self, path, **params):
-        payload, _ = self.raw("/api/v2/" + path + ("?" + urlencode(params) if params else ""))
-        return json.loads(payload)
-
-    def post(self, path, **params):
-        return self.raw("/api/v2/" + path, urlencode(params).encode())[0]
-
-    def info(self, infohash):
-        rows = self.get("torrents/info", hashes=infohash)
-        if not isinstance(rows, list) or len(rows) > 1:
-            raise UpstreamError("qB 返回了不明确的种子记录")
-        return rows[0] if rows else None
-
-    def add(self, job, torrent=None):
-        version = self.raw("/api/v2/app/version")[0].decode().strip()
-        if not re.fullmatch(r"v?5\.1\.[0-9]+", version):
-            raise UpstreamError("离线接种第一版要求 qB 5.1.x 稳定版，接口按 5.1.4 核对")
-        values = {"savepath": job["qb_path"], "category": job["category"], "tags": job["tag"],
-                  "stopped": "true" if torrent else "false", "autoTMM": "false", "useDownloadPath": "false",
-                  "skip_checking": "false", "contentLayout": "Original",
-                  "stopCondition": "FilesChecked" if torrent else "MetadataReceived"}
-        values.update(job.get("share_limits", {}))
-        if torrent is None:
-            values["urls"] = job["magnet"]
-        body, content_type = multipart(values, torrent)
-        if self.raw("/api/v2/torrents/add", body, content_type)[0].strip() != b"Ok.":
-            raise UpstreamError("qB 拒绝添加接种任务")
-
-    def export(self, infohash):
-        return self.raw("/api/v2/torrents/export?" + urlencode({"hash": infohash}))[0]
 
 
 class OfflineCloud(Cloud):
@@ -181,8 +33,43 @@ class OfflineCloud(Cloud):
                 return None
             raise
 
+    def walk(self, path, limit=20000):
+        """All regular files below path as {relative path: info}; None if path is absent."""
+        files, pending = {}, [path]
+        while pending:
+            folder = pending.pop()
+            try:
+                children = self.list_files(folder)  # GetSubFiles with forceRefresh
+            except UpstreamError as error:
+                if error.grpc_status == 5 and folder == path:
+                    return None
+                raise
+            for info in children:
+                if info["directory"]:
+                    pending.append(info["path"])
+                else:
+                    files[info["path"][len(path) + 1:]] = info
+                if len(files) > limit:
+                    raise ValueError("离线目录文件过多")
+        return files
+
     def add_offline(self, link, folder):
-        self.operation("AddOfflineFiles", text_field(1, link) + text_field(2, folder) + number(3, 0))
+        # checkFolderAfterSecs=0: do not let CD2 poll the folder on our behalf.
+        try:
+            self.operation("AddOfflineFiles", text_field(1, link) + text_field(2, folder) + number(3, 0))
+        except UpstreamError as error:
+            if error.grpc_status is not None:
+                # The server answered: a definite rejection (115 code 10008 "任务已存在" arrives as
+                # gRPC 13), not a lost reply.
+                raise OperationRejected(str(error)) from None
+            raise
+
+    def remove_offline(self, infohash, path):
+        """Drop the 115 offline record of infohash (stopping it if running); files are kept.
+
+        path only selects the cloud account; deleteFiles (field 3) is left false.
+        """
+        self.operation("RemoveOfflineFiles", text_field(4, infohash) + text_field(5, path))
 
     def offline(self, folder):
         rows = []
@@ -190,5 +77,46 @@ class OfflineCloud(Cloud):
             for key, value in fields(reply):
                 if key == 1:
                     f = dict(fields(value))
-                    rows.append({"hash": f.get(5, b"").decode().lower(), "status": f.get(4, 0)})
+                    done = f.get(9)  # double percendDone, wire type 1
+                    rows.append({"hash": f.get(5, b"").decode().lower(), "name": f.get(1, b"").decode(),
+                                 "size": f.get(2, 0), "status": f.get(4, 0), "peers": f.get(10, 0),
+                                 "percent": struct.unpack("<d", done)[0] if isinstance(done, bytes) and len(done) == 8 else 0.0})
         return rows
+
+    def delete(self, path):
+        # DeleteFile moves to the provider's recycle bin; never the permanent variant.
+        self.operation("DeleteFile", text_field(1, path))
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # Never forward the API key to a redirected destination.
+
+
+class Arr:
+    """Marks a grab as failed so Arr blocklists the release and searches again."""
+
+    def __init__(self, instance, timeout=15):
+        self.url, self.key, self.timeout = instance["url"].rstrip("/"), secret(instance["api_key"]), timeout
+
+    def call(self, path, method="GET", **params):
+        req = Request(self.url + path + ("?" + urlencode(params) if params else ""), method=method,
+                      data=b"" if method == "POST" else None, headers={"X-Api-Key": self.key})
+        try:
+            with build_opener(NoRedirect()).open(req, timeout=self.timeout) as response:
+                body = response.read(4 * 1024 * 1024)
+                return json.loads(body) if body.strip() else None
+        except HTTPError as error:
+            error.close()
+            raise UpstreamError(f"Arr HTTP {error.code}；{path}") from None
+        except (OSError, ValueError) as error:
+            raise UpstreamError(f"Arr {path} 异常（{type(error).__name__}）") from None
+
+    def mark_failed(self, infohash):
+        # eventType 1 = grabbed. Radarr and Sonarr both expose history/failed/{id} in v3.
+        page = self.call("/api/v3/history", downloadId=infohash.upper(), eventType=1, pageSize=10)
+        records = page.get("records", []) if isinstance(page, dict) else []
+        if not records:
+            return False
+        self.call(f"/api/v3/history/failed/{int(records[0]['id'])}", "POST")
+        return True

@@ -62,7 +62,7 @@ def run_hook(c, source, destination, env=os.environ):
     # Arr uses .NET StringDictionary, which lowercases environment variable names.
     # Normalize only the import keys; paths and download IDs stay case-sensitive.
     keys = {prefix + suffix for prefix in ("radarr", "sonarr")
-            for suffix in ("_sourcepath", "_destinationpath", "_download_id")}
+            for suffix in ("_sourcepath", "_destinationpath", "_download_id", "_transfermode")}
     import_env = {}
     for key, value in env.items():
         name = key.lower()
@@ -78,9 +78,18 @@ def run_hook(c, source, destination, env=os.environ):
     if (source != import_env[prefix + "_sourcepath"]
             or destination != import_env.get(prefix + "_destinationpath")):
         raise ValueError("脚本参数与 Arr 导入环境不一致")
-    size, modified = snapshot(source)
-    payload = {"app": prefix, "source": source, "destination": destination,
-               "size": size, "mtime_ns": modified, "download_id": import_env.get(prefix + "_download_id", "")}
+    # Arr passes Move only when the download client no longer needs the file (no seeding).
+    mode = "move" if import_env.get(prefix + "_transfermode", "").lower() == "move" else "copy"
+    try:
+        size, modified = snapshot(source)
+        payload = {"app": prefix, "source": source, "destination": destination, "transfer_mode": mode,
+                   "size": size, "mtime_ns": modified, "download_id": import_env.get(prefix + "_download_id", "")}
+    except FileNotFoundError:
+        if mode != "move":
+            raise
+        # An earlier run of this hook already moved the source; continue that job.
+        size = modified = None
+        payload = {"app": prefix, "source": source, "destination": destination, "transfer_mode": mode, "resume": True}
     deadline = time.monotonic() + c["timeout_seconds"]
     result = None
     while time.monotonic() < deadline:
@@ -98,13 +107,13 @@ def run_hook(c, source, destination, env=os.environ):
             # The job ID is useful for status/retry; never print raw server replies.
             raise ValueError("云端整理失败，任务 " + result["id"] + "；查看整理服务状态")
         if result["status"] == "completed":
-            if snapshot(source) != (size, modified):
+            if mode == "copy" and snapshot(source) != (size, modified):
                 raise ValueError("整理期间源文件已改变；拒绝确认导入")
             try:
                 target_size, _ = snapshot(destination)
             except OSError:
                 target_size = None
-            if target_size == size:
+            if target_size is not None and target_size == (size or target_size):
                 return "MoveComplete"
             # The API succeeded but the consuming mount may still have stale metadata.
         time.sleep(c["poll_seconds"])

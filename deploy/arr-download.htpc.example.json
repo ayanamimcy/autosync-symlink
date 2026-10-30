@@ -1,0 +1,25 @@
+{
+  "enabled": false,
+  "host": "0.0.0.0",
+  "port": 8097,
+  "username": "arr-download",
+  "password": "${ARR_DOWNLOAD_PASSWORD}",
+  "cloud": {
+    "url": "http://host.docker.internal:19798",
+    "token": "${CD2_DOWNLOAD_TOKEN}"
+  },
+  "account_root": "/115open",
+  "cloud_download_root": "/115open/pt/download",
+  "arr_download_root": "/downloads",
+  "categories": ["radarr-offline", "sonarr-offline"],
+  "send_trackers": true,
+  "delete_files": true,
+  "arr": [
+    {"category": "radarr-offline", "url": "http://radarr:7878", "api_key": "${RADARR_API_KEY}"},
+    {"category": "sonarr-offline", "url": "http://sonarr:8989", "api_key": "${SONARR_API_KEY}"}
+  ],
+  "poll_seconds": 10,
+  "settle_seconds": 30,
+  "timeout_seconds": 86400,
+  "max_errors": 12
+}

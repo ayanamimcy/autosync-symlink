@@ -38,7 +38,8 @@ def load(path):
                                    ("poll_seconds", 5, 1, 300),
                                    ("settle_seconds", 20, 1, 3600),
                                    ("timeout_seconds", 7200, 30, 86400),
-                                   ("max_errors", 12, 1, 1000)):
+                                   ("max_errors", 12, 1, 1000),
+                                   ("target_wait_seconds", 120, 0, 3600)):
         c.setdefault(key, default)
         if type(c[key]) is not int or not low <= c[key] <= high:
             raise ValueError(f"{key} 应为 {low}–{high} 之间的整数")
