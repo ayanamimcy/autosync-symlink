@@ -21,7 +21,8 @@ Arr ──qB API──► arr-download ──AddOfflineFiles──► 115 离线
    - 只有磁力时，目录里文件总大小要达到离线任务报告的大小；
    - 文件都要有云端 ID，并且列表（路径、大小、SHA1）连续 `settle_seconds` 不变。
 5. 就绪后对 Arr 报 `stoppedUP`、进度 100%。`content_path` 指向种子根目录或单文件（目录里有多个顶层项时指向任务目录本身），Arr 照常导入。
-6. 115 离线失败（状态 3）、提交被拒、提交后 10 分钟仍不在离线列表、或超过 `timeout_seconds`：报 `error`。配置了 `arr` 时，代理调用 Arr API 把这次抓取标记为失败（`POST /api/v3/history/failed/{id}`），Arr 会拉黑这个种子，并按“失败下载处理”设置重新搜索。Arr 的 qB 客户端本身不会把 `error` 当作失败，所以不配置 `arr` 的话需要在 Arr 队列里手动“移除并拉黑”。
+6. 可选的预读（`warm.enabled`）：报完成之前，代理通过和 Arr 相同的 CD2 挂载打开每个视频（≥50 MB），先确认挂载上的大小正确，再读开头 `head_mb` 和结尾 `tail_mb`。Arr 导入前会用 ffprobe 读这两段；服务器到 115 网络差时 CD2 读取会失败，挂载上的文件随之显示成 0 字节，ffprobe 失败后 Radarr 以“无法确定是否为样片”永久拒绝。预读成功才报完成，失败每 `retry_seconds` 重试，期间 Arr 看到“检查中”；超过 `timeout_seconds` 仍未成功也报完成，交给 Arr 尝试，不当作下载失败。预读在后台线程里进行，不阻塞其他任务。需要把下载目录只读挂进代理容器（Compose 里的 `/downloads`）。
+7. 115 离线失败（状态 3）、提交被拒、提交后 10 分钟仍不在离线列表、或超过 `timeout_seconds`：报 `error`。配置了 `arr` 时，代理调用 Arr API 把这次抓取标记为失败（`POST /api/v3/history/failed/{id}`），Arr 会拉黑这个种子，并按“失败下载处理”设置重新搜索。Arr 的 qB 客户端本身不会把 `error` 当作失败，所以不配置 `arr` 的话需要在 Arr 队列里手动“移除并拉黑”。
 
 路径对照：
 
@@ -57,6 +58,7 @@ Arr ──qB API──► arr-download ──AddOfflineFiles──► 115 离线
 | `send_trackers` | 默认 true：提交给 115 的磁力带上公开 tracker（只有 infohash、名称和 http/udp tracker）。私有种子一律拒绝 |
 | `delete_files` | 默认 false：是否响应 Arr 的 `deleteFiles=true` |
 | `arr` | 可选，`[{category, url, api_key}]`：失败时通知对应的 Arr |
+| `warm` | 可选预读：`enabled`（默认 false）、`mount_root`（代理容器里的挂载路径，默认同 `arr_download_root`）、`head_mb`/`tail_mb`（默认 16/4）、`timeout_seconds`（默认 1800）、`retry_seconds`（默认 60） |
 | `poll_seconds` / `settle_seconds` / `timeout_seconds` / `max_errors` | 轮询间隔、目录稳定时间、单任务总期限、连续错误上限 |
 
 配置支持 `${环境变量}` 引用。旧版配置的 `qb_download_root`、`offline_categories` 仍然认；`qb`、`seed_after_check`、`import_after` 不再使用，启动日志会列出被忽略的项。旧版数据库里的任务（`downloads` 表）不会被读取或修改。

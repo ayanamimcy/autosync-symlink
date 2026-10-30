@@ -63,6 +63,11 @@ services:
         target: /data
         bind:
           create_host_path: false
+      # Only for "warm": the same CD2 download mount Radarr/Sonarr see, read-only.
+      - type: bind
+        source: "${DOWNLOADS:-/media/media/pt/download}"
+        target: /downloads
+        read_only: true
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
     cap_drop: ["ALL"]

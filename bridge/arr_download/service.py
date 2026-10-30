@@ -5,19 +5,42 @@ offline task list and from the files that actually landed in the job folder.
 """
 import json
 import os
+import posixpath
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from bridge.arr_import.cloud import OperationRejected
 from .clients import Arr, OfflineCloud, UpstreamError
 from .metadata import magnet, magnet_parts, metainfo, offline_magnet
 
-ACTIVE = ("queued", "downloading", "verifying")
+ACTIVE = ("queued", "downloading", "verifying", "warming")
 # Fields changed by Arr requests. The worker never overwrites them with a stale copy.
 CLIENT_FIELDS = ("removed", "category", "tags")
 SUBMIT_GRACE = 600
 LARGE = 1024 * 1024
+VIDEOS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg", ".webm", ".rmvb"}
+
+
+def warm_file(path, size, head, tail):
+    """Read the parts Arr's ffprobe reads, through the same CD2 mount Arr uses."""
+    # Listing the folder first makes CD2 refresh the entry before the path lookup.
+    os.listdir(os.path.dirname(path))
+    actual = os.stat(path).st_size
+    if actual != size:
+        raise ValueError(f"挂载上的文件大小是 {actual}，应为 {size}")
+    with open(path, "rb", buffering=0) as f:
+        for offset, length in ((0, min(head, size)), (max(size - tail, 0), min(tail, size))):
+            f.seek(offset)
+            remaining = length
+            while remaining:
+                chunk = f.read(min(remaining, 4 * LARGE))
+                if not chunk:
+                    raise ValueError(f"挂载读取在偏移 {offset + length - remaining} 处提前结束")
+                if offset == 0 and remaining == length and not any(chunk[:4096]):
+                    raise ValueError("挂载读到的文件头全是 0")
+                remaining -= len(chunk)
 
 
 class Store:
@@ -85,6 +108,8 @@ class Downloader:
         self.stop = threading.Event()
         self.thread = None
         self.extra_categories = set()
+        self.warmers = {}  # infohash -> Future of the background pre-read
+        self.warm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="arr-warm")
 
     # Paths -----------------------------------------------------------------
     def folder(self, infohash):
@@ -230,8 +255,46 @@ class Downloader:
             if now - job["stable_since"] < self.config["settle_seconds"]:
                 return
             tops = {rel.split("/", 1)[0] for rel in files}
-            job.update(status="ready", progress=1.0, ready_at=now, content=tops.pop() if len(tops) == 1 else "",
-                       message="离线完成，等待 Arr 入库")
+            job["content"] = tops.pop() if len(tops) == 1 else ""
+            if not self.config["warm"]["enabled"]:
+                job.update(status="ready", progress=1.0, ready_at=now, message="离线完成，等待 Arr 入库")
+                return
+            job.update(status="warming", warm_started=now, warm_attempts=0, warm_next=now,
+                       message="预读视频文件头尾（确认 CD2 挂载可读）")
+        if job["status"] == "warming":
+            self.warm(job, now)
+
+    def warm(self, job, now):
+        w = self.config["warm"]
+        future = self.warmers.get(job["hash"])
+        if future is None:
+            if now - job["warm_started"] > w["timeout_seconds"]:
+                job.update(status="ready", progress=1.0, ready_at=now,
+                           message="预读一直未成功，仍交给 Arr 入库（" + job.get("warm_error", "") + "）")
+                return
+            if now < job.get("warm_next", 0):
+                return
+            base = w["mount_root"] + "/.arr-offline/" + job["hash"]
+            videos = [(base + "/" + rel, size) for rel, size, _ in job["fingerprint"]
+                      if posixpath.splitext(rel)[1].lower() in VIDEOS and size >= 50 * LARGE]
+            job["warm_attempts"] = job.get("warm_attempts", 0) + 1
+
+            def run():
+                for path, size in videos:
+                    warm_file(path, size, w["head_mb"] * LARGE, w["tail_mb"] * LARGE)
+            self.warmers[job["hash"]] = self.warm_pool.submit(run)
+            job["message"] = f"预读视频文件头尾（第 {job['warm_attempts']} 次）"
+            return
+        if not future.done():
+            return
+        del self.warmers[job["hash"]]
+        error = future.exception()
+        if error is None:
+            job.update(status="ready", progress=1.0, ready_at=now, message="离线完成，预读正常，等待 Arr 入库")
+            return
+        detail = str(error) if isinstance(error, ValueError) else type(error).__name__ + "：" + str(error)[:120]
+        job.update(warm_error=detail, warm_next=now + w["retry_seconds"],
+                   message=f"预读失败（第 {job['warm_attempts']} 次）：{detail}；稍后重试")
 
     def cleanup(self, job, cloud):
         """Arr removed the item: drop the 115 offline record and, with deleteFiles, the folder."""
@@ -324,6 +387,7 @@ class Downloader:
 
     def close(self):
         self.stop.set()
+        self.warm_pool.shutdown(wait=False, cancel_futures=True)
         if self.thread:
             self.thread.join(timeout=60)
 
@@ -340,7 +404,7 @@ class Downloader:
 
     def row(self, job):
         save_path, content_path = self.paths(job)
-        state = {"queued": "metaDL", "downloading": "downloading", "verifying": "checkingDL",
+        state = {"queued": "metaDL", "downloading": "downloading", "verifying": "checkingDL", "warming": "checkingDL",
                  "ready": "stoppedUP", "failed": "error"}[job["status"]]
         size = job.get("size") or 0
         done = job["status"] == "ready"

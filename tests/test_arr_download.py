@@ -56,7 +56,9 @@ def config():
             "arr_download_root": "/downloads", "categories": ["radarr", "sonarr"],
             "poll_seconds": 1, "settle_seconds": 2, "timeout_seconds": 86400, "max_errors": 3,
             "send_trackers": True, "delete_files": True, "retired_keys": [],
-            "arr": [{"category": "radarr", "url": "http://radarr:7878", "api_key": "radarr-key"}]}
+            "arr": [{"category": "radarr", "url": "http://radarr:7878", "api_key": "radarr-key"}],
+            "warm": {"enabled": False, "mount_root": "/downloads", "head_mb": 1, "tail_mb": 1,
+                     "timeout_seconds": 1800, "retry_seconds": 60}}
 
 
 def cloud_file(path, size, sha1="a" * 40):
@@ -374,6 +376,79 @@ class OfflineTests(Base):
         self.assertFalse(complete({"size": 0}, {}))
 
 
+class WarmTests(Base):
+    """Pre-read through a directory standing in for the CD2 mount."""
+
+    def setUp(self):
+        super().setUp()
+        self.mount = Path(self.tmp.name) / "mount"
+        self.cfg["warm"].update(enabled=True, mount_root=str(self.mount))
+        self.size = 60 * MB
+        self.link = "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=Movie"
+        self.folder = "/115open/pt/download/.arr-offline/" + "a" * 40
+        self.local = self.mount / ".arr-offline" / ("a" * 40) / "Movie" / "Movie.mkv"
+
+    def reach_warming(self):
+        self.d.submit({"category": "radarr", "urls": self.link})
+        self.ticks()
+        self.cloud.progress(self.folder, 2, 100.0, size=self.size)
+        self.cloud.land(self.folder, {"Movie/Movie.mkv": self.size})
+        self.ticks(4, step=2)
+        self.assertEqual(self.job("a" * 40)["status"], "warming")
+        self.assertEqual(self.d.row(self.job("a" * 40))["state"], "checkingDL")
+
+    def settle(self, step=1):
+        for _ in range(20):
+            self.d.tick()
+            for future in list(self.d.warmers.values()):
+                future.result(timeout=10) if not future.exception(timeout=10) else None
+            self.time += step
+
+    def write(self, size, head=b"\x1a\x45\xdf\xa3"):
+        self.local.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.local, "wb") as f:
+            if size:
+                f.write(head)
+                f.truncate(size)
+                f.seek(size - 1)
+                f.write(b"x")
+
+    def test_successful_pre_read_reports_ready(self):
+        self.write(self.size)
+        self.reach_warming()
+        self.settle()
+        job = self.job("a" * 40)
+        self.assertEqual(job["status"], "ready")
+        self.assertIn("预读正常", job["message"])
+
+    def test_wrong_size_or_zero_header_retries_until_mount_is_readable(self):
+        self.write(0)
+        self.reach_warming()
+        self.settle()
+        job = self.job("a" * 40)
+        self.assertEqual(job["status"], "warming")
+        self.assertIn("大小是 0", job["message"])
+        self.write(self.size, head=b"\0" * 8)
+        self.time += 61
+        self.settle()
+        self.assertIn("全是 0", self.job("a" * 40)["message"])
+        self.write(self.size)
+        self.time += 61
+        self.settle()
+        self.assertEqual(self.job("a" * 40)["status"], "ready")
+        self.assertEqual(self.arr.failed, [])
+
+    def test_pre_read_that_never_succeeds_still_hands_over_to_arr(self):
+        self.reach_warming()  # nothing at the mount path at all
+        self.settle()
+        self.time += 1801
+        self.settle()
+        job = self.job("a" * 40)
+        self.assertEqual(job["status"], "ready")
+        self.assertIn("预读一直未成功", job["message"])
+        self.assertEqual(self.arr.failed, [])
+
+
 class MetadataTests(unittest.TestCase):
     def test_original_info_hash_trackers_and_padding(self):
         meta = metainfo(torrent())
@@ -513,7 +588,7 @@ class HttpTests(Base):
 class ConfigTests(unittest.TestCase):
     def test_old_key_names_are_accepted_and_retired_keys_reported(self):
         cfg = config()
-        for key in ("retired_keys", "send_trackers", "delete_files"):
+        for key in ("retired_keys", "send_trackers", "delete_files", "warm"):
             del cfg[key]
         cfg["qb_download_root"] = cfg.pop("arr_download_root")
         cfg["offline_categories"] = cfg.pop("categories")
@@ -527,6 +602,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(loaded["retired_keys"], ["import_after", "qb", "seed_after_check"])
             self.assertTrue(loaded["send_trackers"])
             self.assertFalse(loaded["delete_files"])
+            self.assertEqual(loaded["warm"], {"enabled": False, "mount_root": "/downloads", "head_mb": 16,
+                                              "tail_mb": 4, "timeout_seconds": 1800, "retry_seconds": 60})
             for change in ({"cloud_download_root": "/another-account/download"},
                            {"arr": [{"category": "unknown", "url": "http://r", "api_key": "k"}]},
                            {"password": "short"}):

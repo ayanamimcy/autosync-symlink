@@ -44,6 +44,19 @@ def load(path):
             or any(not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", v) for v in categories)
             or len(set(categories)) != len(categories)):
         raise ValueError("categories 必须为不重复的分类名称列表")
+    warm = c.setdefault("warm", {})
+    if not isinstance(warm, dict):
+        raise ValueError("warm 必须是对象")
+    warm.setdefault("enabled", False)
+    warm.setdefault("mount_root", c["arr_download_root"])
+    if type(warm["enabled"]) is not bool:
+        raise ValueError("warm.enabled 必须为布尔值")
+    remote_path(warm["mount_root"])
+    for key, default, low, high in (("head_mb", 16, 1, 1024), ("tail_mb", 4, 0, 1024),
+                                   ("timeout_seconds", 1800, 60, 86400), ("retry_seconds", 60, 5, 3600)):
+        warm.setdefault(key, default)
+        if type(warm[key]) is not int or not low <= warm[key] <= high:
+            raise ValueError(f"warm.{key} 应为 {low}–{high} 之间的整数")
     arr = c.setdefault("arr", [])
     if not isinstance(arr, list):
         raise ValueError("arr 必须是列表")
