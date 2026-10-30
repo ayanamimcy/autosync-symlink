@@ -1,5 +1,6 @@
 """Bounded gRPC-Web operations, using the official CloudDrive protocol."""
 import posixpath
+import re
 
 from bridge.cloud import CloudClient
 from bridge.protocol import fields, messages, text_field, varint
@@ -63,9 +64,10 @@ class Cloud:
         try:
             return next((f for f in self.list_files(posixpath.dirname(path)) if f["path"] == path), None)
         except ConnectionError as e:
-            # Only the codec's exact NOT_FOUND status denotes an absent parent.
-            # Permission/auth/transport errors must never masquerade as absence.
-            if str(e).startswith("CloudDrive gRPC 状态 5；"):
+            # Only NOT_FOUND denotes an absent parent: CD2 sends it either as a response
+            # header ("状态 5") or a trailer ("状态 5；…"). Permission/auth/transport
+            # errors must never masquerade as absence.
+            if re.match(r"CloudDrive gRPC 状态 5(?:；|$)", str(e)):
                 return None
             raise
 

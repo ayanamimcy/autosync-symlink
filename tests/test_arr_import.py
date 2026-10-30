@@ -339,6 +339,18 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(destination.stat().st_size, 100)
 
 
+class CloudNotFoundTests(unittest.TestCase):
+    def test_not_found_from_header_or_trailer_is_absence_other_errors_raise(self):
+        cloud = Cloud.__new__(Cloud)
+        for message in ("CloudDrive gRPC 状态 5", "CloudDrive gRPC 状态 5；检查会员权限/Token"):
+            with self.subTest(message=message), patch.object(Cloud, "rpc", side_effect=ConnectionError(message)):
+                self.assertIsNone(cloud.get_file("/115/.arr-import/job/release.mkv"))
+        for message in ("CloudDrive gRPC 状态 7", "CloudDrive gRPC 状态 50", "CloudDrive HTTP 500"):
+            with self.subTest(message=message), patch.object(Cloud, "rpc", side_effect=ConnectionError(message)):
+                with self.assertRaises(ConnectionError):
+                    cloud.get_file("/115/.arr-import/job/release.mkv")
+
+
 class HookEnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
