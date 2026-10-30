@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from bridge.cloud import CloudClient, CloudFile, cloud_file
 from bridge.cloud_scan import CloudScanError, CloudScanner, mapped_cloud_path
+from bridge.cloud_content import CloudContent
 from bridge.config import atomic_json, load, validate
 from bridge.protocol import fields, frame, text_field, varint
 from bridge.service import Service
@@ -112,13 +113,24 @@ class ApiScanTests(Fixture):
     def api(self, cached=None, fresh=None):
         cached = self.inventory() if cached is None else cached
         fresh = cached if fresh is None else fresh
+        infos = {e.path:e for entries in cached.values() if isinstance(entries,list) for e in entries}
+        contents = {path:(self.source/Path(path).relative_to(self.lib["cloud_path"])).read_bytes()
+                    for path,e in infos.items() if not e.directory and Path(path).suffix.lower() in (".nfo", ".srt", ".jpg", ".png")}
         def listing(client, path, token, force_refresh=False):
             self.assertEqual(token, "test-token")
             value = (fresh if force_refresh else cached)[path]
             if isinstance(value, Exception):
                 raise value
             return value
-        with patch.object(CloudClient, "list_files", autospec=True, side_effect=listing) as rpc:
+        def metadata_rpc(reader, method, payload, checkpoint):
+            f = dict(fields(payload)); path = f[1].decode()
+            return (text_field(1, "/mock"+path) if method == "GetDownloadUrlPath"
+                    else encoded(infos[path+"/"+f[2].decode()]))
+        def download(reader, location, expected_size, checkpoint):
+            return contents[location[len("/mock"):]]
+        with patch.object(CloudClient, "list_files", autospec=True, side_effect=listing) as rpc, \
+             patch.object(CloudContent, "rpc", autospec=True, side_effect=metadata_rpc), \
+             patch.object(CloudContent, "download", autospec=True, side_effect=download):
             yield rpc
 
     def test_api_inventory_never_walks_or_stats_video_paths_on_mount(self):
@@ -325,9 +337,19 @@ class ApiScanTests(Fixture):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 f = dict(fields(body[5:])); path = f[1].decode()
                 requests.append((self.path, path, f[2], self.headers.get("Authorization")))
-                data = b"".join(frame(blob(1, encoded(e))) for e in entries[path]) + trailer()
+                if self.path.endswith("/GetSubFiles"):
+                    data = b"".join(frame(blob(1, encoded(e))) for e in entries[path]) + trailer()
+                elif self.path.endswith("/GetDownloadUrlPath"):
+                    data = frame(text_field(1, "/download")) + trailer()
+                else:
+                    entry = next(e for e in entries[path] if e.name == f[2].decode())
+                    data = frame(encoded(entry)) + trailer()
                 self.send_response(200); self.send_header("Content-Type", "application/grpc-web+proto")
                 self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+            def do_GET(self):
+                data = b"<movie/>"
+                self.send_response(200); self.send_header("Content-Length", str(len(data)))
+                self.end_headers(); self.wfile.write(data)
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         try:
@@ -344,8 +366,11 @@ class ApiScanTests(Fixture):
         self.assertEqual(result["change_count"], 2)
         self.assertEqual(status["latest"]["status"], "complete")
         self.assertIsNotNone(status["last_full_success"])
-        self.assertEqual(len(requests), 2)
-        self.assertTrue(all(r[0].endswith("/GetSubFiles") and r[2] == 0 and r[3] == "Bearer test-token" for r in requests))
+        self.assertEqual(len(requests), 4)
+        listings = [r for r in requests if r[0].endswith("/GetSubFiles")]
+        self.assertEqual(len(listings), 2)
+        self.assertTrue(all(r[2] == 0 for r in listings))
+        self.assertTrue(all(r[3] == "Bearer test-token" for r in requests))
 
 
 class ApiConfigTests(Fixture):

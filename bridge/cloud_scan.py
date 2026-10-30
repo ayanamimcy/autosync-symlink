@@ -68,6 +68,10 @@ class CloudScanner:
         if remaining > 0:
             raise CloudScanError(f"CD2 API 限流冷却中（剩余 {int(remaining)+1} 秒），跳过本次请求")
 
+    def note_rate_limit(self):
+        with self._cooldown_lock:
+            self._cooldowns[self.config["cloud"]["url"]] = time.monotonic() + 60
+
     def listing(self, path, refresh=False):
         try:
             # Space request starts across all directory workers, including fresh
@@ -99,8 +103,7 @@ class CloudScanner:
                 if not self.failures:
                     self.failures.append(failure)
                 if re.match(r"CloudDrive (?:HTTP 429|gRPC 状态 8)(?:$|[；\s])", str(error)):
-                    with self._cooldown_lock:
-                        self._cooldowns[self.config["cloud"]["url"]] = time.monotonic() + 60
+                    self.note_rate_limit()
                 self.stopped.set()
             if failure is error:
                 raise

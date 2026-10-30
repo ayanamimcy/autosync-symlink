@@ -27,3 +27,5 @@ CloudDrive 服务为 clouddrive.CloudDriveFileSrv，端点 GetToken / GetSystemI
 主扫描后端另外使用 `GetSubFiles(ListSubFileRequest) returns (stream SubFilesReply)`：请求字段 1 为 path、2 为 forceRefresh；不设置可选字段 3 checkExpires，沿用服务端策略。普通枚举显式 forceRefresh=false，清理缺失校验才使用 true。SubFilesReply 字段 1 为重复 CloudDriveFile，文件字段 2/3/4/5/7/30/36 分别为名称、完整虚拟路径、大小、类型（0 目录 / 1 文件 / 2 其他）、修改时间 Timestamp、目录标志、禁止访问标志。Timestamp 使用 seconds 字段 1 与 nanos 字段 2，保留纳秒。独立 Arr 模块继续使用其自身的强制刷新策略，不受扫描后端开关影响。
 
 Plex 使用 GET /library/sections/{id}/refresh?path=... 和 X-Plex-Token。Emby/Jellyfin 使用 POST /Library/Media/Updated，数据为 Updates 数组，元素包含 Path 和 UpdateType。Jellyfin 使用 Authorization: MediaBrowser Token="..."；Emby 使用 X-Emby-Token。具体服务器版本、挂载点可见性和实际推送订阅仍需在目标机验收。
+
+API 元数据读取使用 GetDownloadUrlPath：请求字段 1/2/3/4 为 path / preview / lazy_read / get_direct_url，后三者显式 false。DownloadUrlPathInfo 字段 1 为带占位符的 CD2 下载路径（替换 {SCHEME}/{HOST}/{PREVIEW}），不使用字段 3 directUrl。FindFileByPathRequest 字段 1 为父目录，2 为文件名，返回 CloudDriveFile。读取文件需要 allow_read 权限。已在目标机用一个 20 字节健康标记完成单文件 HTTP 下载及属性查询验证，未执行全库扫描。

@@ -13,6 +13,7 @@ from .paths import file_hash, is_link, no_link_ancestors, safe_join, walk
 from .mounts import identities, assert_unchanged
 from .parallel import bounded_map
 from .cloud_scan import CloudScanner
+from .cloud_content import CloudContent
 
 VIDEOS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg", ".webm", ".iso", ".rmvb"}
 METADATA = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".xml"}
@@ -25,6 +26,7 @@ class Engine:
         self.directory_lock = threading.Lock()
         self.scan_progress = scan_progress
         self.cloud_paths = cloud_paths or {}
+        self.metadata_reader = None
 
     def health(self, lib):
         identities(lib)
@@ -85,12 +87,14 @@ class Engine:
     def apply_file(self, lib, item, row, mount_ids, now, dry_run, aborted):
         p, st, rel, kind, dest_rel = item
         source, output = Path(lib["source"]), Path(lib["output"])
-        stage = "复制元数据" if kind == "metadata" else "生成索引"
+        api_metadata = kind == "metadata" and self.metadata_reader is not None
+        stage = ("CD2 元数据同步" if api_metadata else "复制元数据") if kind == "metadata" else "生成索引"
+        progress_path = self.metadata_reader.scanner.root.rstrip("/")+"/"+rel if api_metadata else str(p)
         def checkpoint():
             if aborted.is_set():
                 raise InterruptedError("并发扫描已停止，等待下次对账")
             assert_unchanged(lib, mount_ids)
-            self.progress(stage, str(p))
+            self.progress(stage, progress_path)
         checkpoint()
         dest = safe_join(output, dest_rel)
         sig = f"{st.st_size}:{st.st_mtime_ns}:{kind}:{lib['strm_prefix']}"
@@ -133,16 +137,17 @@ class Engine:
                 with temp.open("xb") as f:
                     f.write(payload); f.flush(); os.fsync(f.fileno())
             else:
-                # API inventory does not walk mounted ancestors. Before reading
-                # metadata, retain the source symlink/junction protection.
-                no_link_ancestors(p)
-                with p.open("rb") as f:
-                    payload = f.read(self.config["sync"]["metadata_max_mb"]*1024*1024+1)
-                if len(payload) > self.config["sync"]["metadata_max_mb"]*1024*1024:
-                    raise OSError(f"元数据读取超限（上限 {self.config['sync']['metadata_max_mb']} MiB）")
-                after = p.stat()
-                if (after.st_size, after.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
-                    raise OSError("源文件仍在变动，等待下次重试")
+                if self.metadata_reader:
+                    payload = self.metadata_reader.read(rel, st, checkpoint)
+                else:
+                    no_link_ancestors(p)
+                    with p.open("rb") as f:
+                        payload = f.read(self.config["sync"]["metadata_max_mb"]*1024*1024+1)
+                    if len(payload) > self.config["sync"]["metadata_max_mb"]*1024*1024:
+                        raise OSError(f"元数据读取超限（上限 {self.config['sync']['metadata_max_mb']} MiB）")
+                    after = p.stat()
+                    if (after.st_size, after.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+                        raise OSError("源文件仍在变动，等待下次重试")
                 fingerprint = hashlib.sha256(payload).hexdigest()
                 if row and exists and fingerprint == row["fingerprint"]:
                     checkpoint()
@@ -196,9 +201,11 @@ class Engine:
             self.progress(stage, path)
             report(stage=stage, path=path)
         scanner, files = None, []
+        self.metadata_reader = None
         backend = self.config["sync"]["scan_backend"]
         if backend == "clouddrive":
             scanner = CloudScanner(self.config, lib, reading, self.cloud_paths.get(lib["id"]))
+            self.metadata_reader = CloudContent(scanner)
             inventory = scanner.walk(scope)
         else:
             base = safe_join(source,scope) if scope else source
