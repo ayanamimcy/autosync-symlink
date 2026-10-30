@@ -1,11 +1,15 @@
 import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import posixpath
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -282,11 +286,67 @@ class ImportTests(unittest.TestCase):
         self.addCleanup(self.imp.stop.set)
         hc = {"url": f"http://127.0.0.1:{server.server_port}", "token": self.cfg["token"],
               "timeout_seconds": 5, "poll_seconds": 0.01}
-        env = {"Radarr_SourcePath": str(source), "Radarr_DestinationPath": str(destination)}
-        self.assertEqual(hook.run_hook(hc, str(source), str(destination), env), "MoveComplete")
+        hook_path = root / "hook.json"
+        hook_path.write_text(json.dumps({**hc, "poll_seconds": 1}))
+        env = {key: value for key, value in os.environ.items()
+               if not key.lower().startswith(("radarr_", "sonarr_"))}
+        # Arr's StringDictionary lowercases keys before starting the process.
+        env.update(radarr_sourcepath=str(source), radarr_destinationpath=str(destination),
+                   radarr_download_id="Torrent-InfoHash")
+        result = subprocess.run([sys.executable, str(Path(hook.__file__).resolve()),
+                                 str(source), str(destination), "--config", str(hook_path)],
+                                env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[MoveStatus] MoveComplete")
         self.assertTrue(source.is_file())
         self.assertEqual(source.stat().st_size, 100)
         self.assertEqual(destination.stat().st_size, 100)
+
+
+class HookEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.source = str(Path(self.tmp.name) / "Movie & 电影 (2009).mkv")
+        self.destination = str(Path(self.tmp.name) / "Movies" / "Movie (2009).mkv")
+        Path(self.source).write_bytes(b"video")
+        self.config = {"timeout_seconds": 5, "poll_seconds": 1}
+
+    def test_environment_key_casing_for_radarr_and_sonarr_preserves_values(self):
+        for prefix in ("Radarr", "Sonarr"):
+            original = {prefix + "_SourcePath": self.source,
+                        prefix + "_DestinationPath": self.destination,
+                        prefix + "_Download_Id": "CaseSensitive-Torrent-ID"}
+            for case in (str.lower, str.upper, lambda value: value):
+                with self.subTest(app=prefix, keys=case(prefix + "_SourcePath")):
+                    env = {case(key): value for key, value in original.items()}
+                    with patch.object(hook, "request", return_value={"status": "native"}) as request:
+                        self.assertEqual(hook.run_hook(self.config, self.source, self.destination, env),
+                                         "DeferMove")
+                    payload = request.call_args.args[2]
+                    self.assertEqual(payload["app"], prefix.lower())
+                    self.assertEqual(payload["source"], self.source)
+                    self.assertEqual(payload["destination"], self.destination)
+                    self.assertEqual(payload["download_id"], "CaseSensitive-Torrent-ID")
+
+    def test_missing_ambiguous_conflicting_or_mismatched_environment_never_submits(self):
+        valid = {"radarr_sourcepath": self.source, "radarr_destinationpath": self.destination}
+        cases = [
+            {},
+            {"radarr_destinationpath": self.destination},
+            {"radarr_sourcepath": self.source},
+            {**valid, "sonarr_sourcepath": self.source, "sonarr_destinationpath": self.destination},
+            {**valid, "radarr_sourcepath": self.source.lower()},
+            {**valid, "radarr_destinationpath": self.destination.lower()},
+            {**valid, "Radarr_SourcePath": self.source + ".other"},
+            {**valid, "Radarr_DestinationPath": self.destination + ".other"},
+            {**valid, "radarr_download_id": "one", "Radarr_Download_Id": "two"},
+        ]
+        for index, env in enumerate(cases):
+            with self.subTest(case=index), patch.object(hook, "request") as request:
+                with self.assertRaises(ValueError):
+                    hook.run_hook(self.config, self.source, self.destination, env)
+                request.assert_not_called()
 
 
 class WireTests(unittest.TestCase):

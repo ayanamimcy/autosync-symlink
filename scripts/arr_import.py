@@ -59,15 +59,28 @@ def snapshot(path):
 
 
 def run_hook(c, source, destination, env=os.environ):
-    prefixes = [p for p in ("Radarr", "Sonarr") if env.get(p + "_SourcePath")]
+    # Arr uses .NET StringDictionary, which lowercases environment variable names.
+    # Normalize only the import keys; paths and download IDs stay case-sensitive.
+    keys = {prefix + suffix for prefix in ("radarr", "sonarr")
+            for suffix in ("_sourcepath", "_destinationpath", "_download_id")}
+    import_env = {}
+    for key, value in env.items():
+        name = key.lower()
+        if name not in keys:
+            continue
+        if name in import_env and import_env[name] != value:
+            raise ValueError("Arr 导入环境变量存在大小写冲突")
+        import_env[name] = value
+    prefixes = [p for p in ("radarr", "sonarr") if import_env.get(p + "_sourcepath")]
     if len(prefixes) != 1:
         raise ValueError("必须由 Radarr/Sonarr 的 Import Using Script 调用")
     prefix = prefixes[0]
-    if source != env[prefix + "_SourcePath"] or destination != env.get(prefix + "_DestinationPath"):
+    if (source != import_env[prefix + "_sourcepath"]
+            or destination != import_env.get(prefix + "_destinationpath")):
         raise ValueError("脚本参数与 Arr 导入环境不一致")
     size, modified = snapshot(source)
-    payload = {"app": prefix.lower(), "source": source, "destination": destination,
-               "size": size, "mtime_ns": modified, "download_id": env.get(prefix + "_Download_Id", "")}
+    payload = {"app": prefix, "source": source, "destination": destination,
+               "size": size, "mtime_ns": modified, "download_id": import_env.get(prefix + "_download_id", "")}
     deadline = time.monotonic() + c["timeout_seconds"]
     result = None
     while time.monotonic() < deadline:
