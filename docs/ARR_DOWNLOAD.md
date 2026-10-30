@@ -1,137 +1,92 @@
-# 公开 BT 离线下载与 qB 接种
+# 115 离线下载（虚拟 qBittorrent）
 
-可选模块 `python -m bridge.arr_download`，与 `bridge.arr_import`、软链接同步分别运行和配置。复用同一 Dockerfile 和镜像，服务本身不挂载媒体文件，也不调用旧的独立媒体编排项目。下载代理是新增本地实现；真实 CD2/115、qB 5.1.4 和 Arr 的端到端下载验收仍需单任务验证。
+可选模块 `python -m bridge.arr_download`。它对 Radarr/Sonarr 表现为一个 qBittorrent 下载客户端，背后没有真实的 qB：收到的种子直接交给 115 离线下载（经 CD2 API），队列里的进度、完成和失败都来自 115 离线任务列表和离线目录里实际出现的文件。和 `bridge.arr_import`、软链接同步分开运行、分开配置，用同一个镜像。
+
+```
+Arr ──qB API──► arr-download ──AddOfflineFiles──► 115 离线
+                    │  ListOfflineFilesByPath / GetSubFiles 轮询
+                    ▼
+ Arr 队列显示完成 → Arr 导入 → Import Using Script → arr-import（CD2 云端移动/复制 + 改名）
+```
+
+从添加到 Arr 可以入库，115 有缓存的资源一般是一两分钟（实测 276 MB 公开种子约 1.5 分钟），整个过程不经过本机下载或上传。
 
 ## 工作流程
 
-Arr 的 qB 下载客户端指向代理 → 代理保存原始种子/磁力 → qB 取得原始文件清单并停止 → CD2 创建隔离目录并提交 115 离线 → 核验完整云端文件集合。随后入库与 qB 接种独立运行：
+1. Arr 调用 `torrents/add`（磁力或 .torrent）。代理解析 infohash，只接受配置里列出的分类，拒绝私有种子和 BT v2。
+2. 后台在 `cloud_download_root/.arr-offline/<infohash>` 建目录，提交离线。提交前先记下“已提交”：回复丢失或重启后按离线列表对账，不会重复提交。
+3. 离线进行中：`percendDone` 作为进度，Arr 队列显示下载中。
+4. 离线完成后核验离线目录：
+   - 有 .torrent 时，种子里每个 ≥1 MiB 的文件都要以相同文件名和大小出现（115 有时不建种子根目录、会丢 .txt/.url 之类的小文件，所以不按完整路径比）；
+   - 只有磁力时，目录里文件总大小要达到离线任务报告的大小；
+   - 文件都要有云端 ID，并且列表（路径、大小、SHA1）连续 `settle_seconds` 不变。
+5. 就绪后对 Arr 报 `stoppedUP`、进度 100%。`content_path` 指向种子根目录或单文件（目录里有多个顶层项时指向任务目录本身），Arr 照常导入。
+6. 115 离线失败（状态 3）、提交被拒、提交后 10 分钟仍不在离线列表、或超过 `timeout_seconds`：报 `error`。配置了 `arr` 时，代理调用 Arr API 把这次抓取标记为失败（`POST /api/v3/history/failed/{id}`），Arr 会拉黑这个种子，并按“失败下载处理”设置重新搜索。Arr 的 qB 客户端本身不会把 `error` 当作失败，所以不配置 `arr` 的话需要在 Arr 队列里手动“移除并拉黑”。
 
-- `import_after=cloud_ready`：云端文件集合核验、稳定后即可由 Arr 通过已有 Import Using Script 复制、改名入库，同时 qB 完整分块校验；校验 100% 后请求做种。
-- `import_after=qb_checked`（未配置时的默认值）：等 qB 完整校验 100% 后允许入库，同时请求做种。入库不等待做种时长、分享率或实际上传量。
+路径对照：
 
-两种模式都保留原始做种文件。入库后 Arr 移除已完成下载记录，只隐藏代理的交付记录，后台 qB 校验、做种继续进行。qB 做种读取原文件，CD2 入库复制并改名副本；两者可以并行。
-
-磁力用 qB 5.1.x 的 `stopCondition=MetadataReceived` 获取元数据；上传的 .torrent 以 `stopped=true`、`skip_checking=false` 添加。qB 暂停会清除停止条件，因此元数据尚未取得时通过代理暂停后恢复，会安全移除该空元数据任务，再以 MetadataReceived 重新添加。不会直接恢复不带停止条件的磁力。原始 .torrent 和元数据保存在私有下载任务数据库中。
-
-每个 infohash 的做种目录单独隔离：
-
-| 路径视图 | 示例 |
+| 视图 | 示例 |
 | --- | --- |
-| qB / Arr | `/downloads/.arr-offline/<infohash>/原始种子目录/视频.mkv` |
-| CD2 | `/115open/pt/download/.arr-offline/<infohash>/原始种子目录/视频.mkv` |
+| Arr（`arr_download_root`） | `/downloads/.arr-offline/<infohash>/种子名/视频.mkv` |
+| CD2（`cloud_download_root`） | `/115open/pt/download/.arr-offline/<infohash>/种子名/视频.mkv` |
 
-现有 `/downloads` → `/115open/pt/download` 入库映射能直接覆盖这些子目录。整理只处理副本，原做种目录保留。不涉及独立 `/cloud_downloads` 挂载。
+`arr_download_root` 必须是 Arr 容器里 `cloud_download_root` 对应的挂载路径，入库规则（`arr-import.json`）的 `source_root`/`cloud_source_root` 要能覆盖它。
 
-## 开关与配置
+## 入库：移动还是复制
 
-配置由 `--config /settings/arr-download.json` 指定，持久化使用 `--data-dir /data`，数据库为 `downloads.sqlite3`。
+没有做种，下载目录里的文件入库后就没用了。每个种子报 `ratio_limit=0`（已达分享率），所以：
 
-```json
-{
-  "enabled": false,
-  "host": "0.0.0.0",
-  "port": 8097,
-  "username": "arr-download",
-  "password": "${ARR_DOWNLOAD_PASSWORD}",
-  "qb": {
-    "url": "http://host.docker.internal:8080",
-    "username": "${ARR_DOWNLOAD_QB_USER}",
-    "password": "${ARR_DOWNLOAD_QB_PASSWORD}"
-  },
-  "cloud": {
-    "url": "http://100.78.216.82:19798",
-    "token": "${CD2_DOWNLOAD_TOKEN}"
-  },
-  "account_root": "/115open",
-  "cloud_download_root": "/115open/pt/download",
-  "qb_download_root": "/downloads",
-  "offline_categories": ["radarr-offline-test", "sonarr-offline-test"],
-  "seed_after_check": true,
-  "import_after": "cloud_ready",
-  "poll_seconds": 5,
-  "settle_seconds": 20,
-  "timeout_seconds": 86400,
-  "max_errors": 12
-}
-```
+- Arr 下载客户端设置里**打开“移除已完成”（Remove Completed）**时，Arr 用 Move 模式导入，`arr-import` 在云端直接移动、改名，不留副本；导入后 Arr 发 `torrents/delete`（`deleteFiles=true`），`delete_files=true` 时代理把这个任务的离线目录（剩下的 NFO、样片等）送进网盘回收站。
+- 不打开时 Arr 用 Copy 模式，`arr-import` 云端复制，下载目录保留，需要自己清理。
 
-- `enabled`：是否对所选分类接管离线；关闭后，新普通任务可直通真实 qB。已有未完成或失败任务保持代理控制，不能通过切换模式让同一种子直接开始下载。
-- `offline_categories`：只接管明确列出的分类；其他分类走原 qB。存在活动离线任务时，直通请求也需要能识别 v1 hash 以避免接管冲突，不接受此时无法解析的远程 .torrent URL。
-- `seed_after_check`：创建任务时记录是否在完整校验后启动做种；false 则保持已完成、停止状态。修改配置只影响新任务。
-- `import_after`：入库放行条件，取值为 `cloud_ready` 或 `qb_checked`，未配置时默认后者。创建任务时记录，修改配置只影响新任务。
-- 入库模式继续使用原 `arr-import.json` 的独立配置。
+`delete_files` 只会删除 `cloud_download_root/.arr-offline/<infohash>` 这一个目录，用的是 `DeleteFile`（进回收站），不是永久删除。
 
-`cloud_ready` 允许先入库，但云端文件名、长度和 SHA1 就绪不等同于 BT 分块校验通过。如果后台 qB 校验失败，任务状态报告失败及交付警告，不启动做种，也不自动删除已入库副本。可检查文件后通过重试接口重新校验。若希望校验失败的文件完全不进入媒体库，选择 `qb_checked`。
+## 配置
 
-代理密码使用独立、至少 24 字符的随机密钥。真实 qB 登录信息与 CD2 token 只提供给代理容器；Arr 填写代理自己的用户名/密码。配置通过环境变量引用密钥，部署文件不包含真实凭据。保护配置、环境文件和数据目录，数据目录建议 0700；下载数据库使用 0600。
+`--config /settings/arr-download.json`，数据目录 `--data-dir /data`（`downloads.sqlite3`，表 `offline_jobs`）。示例：[deploy/arr-download.htpc.example.json](../deploy/arr-download.htpc.example.json)。
 
-CD2 token 需要 `allow_list`、`allow_create_folder`、`allow_get_transfer_tasks`、`allow_add_offline_download`、`allow_list_offline_downloads`。范围应覆盖配置的下载目录；入库服务的复制、改名权限仍由原入库 token 配置。下载代理不需要删除文件权限。
+| 配置 | 含义 |
+| --- | --- |
+| `enabled` | 关闭后拒绝新任务（Arr 添加时报错），已有任务暂停轮询 |
+| `username` / `password` | Arr 里填写的下载客户端账号；密码至少 24 字符。也接受 `Authorization: Bearer <password>` |
+| `cloud.url` / `cloud.token` | CD2 地址和 API 令牌。**要用 Arr 挂载所在的那个 CD2**，否则挂载侧的目录缓存看不到新文件 |
+| `account_root` | 115 账号在 CD2 里的根，如 `/115open` |
+| `cloud_download_root` / `arr_download_root` | 同一个下载目录在 CD2 和 Arr 里的路径 |
+| `categories` | 走离线的分类，Arr 下载客户端的 Category 填其中之一 |
+| `send_trackers` | 默认 true：提交给 115 的磁力带上公开 tracker（只有 infohash、名称和 http/udp tracker）。私有种子一律拒绝 |
+| `delete_files` | 默认 false：是否响应 Arr 的 `deleteFiles=true` |
+| `arr` | 可选，`[{category, url, api_key}]`：失败时通知对应的 Arr |
+| `poll_seconds` / `settle_seconds` / `timeout_seconds` / `max_errors` | 轮询间隔、目录稳定时间、单任务总期限、连续错误上限 |
 
-## 部署与接入 HTPC
+配置支持 `${环境变量}` 引用。旧版配置的 `qb_download_root`、`offline_categories` 仍然认；`qb`、`seed_after_check`、`import_after` 不再使用，启动日志会列出被忽略的项。旧版数据库里的任务（`downloads` 表）不会被读取或修改。
 
-同一源码构建镜像自动包含本模块，不需要更改 Actions 或 Dockerfile。未发布新源码前，旧 `edge` 镜像不含本模块；应先本地构建，或待对应 Actions 发布成功后使用固定镜像标签。
+CD2 令牌需要：列目录、新建目录、添加/查看/删除离线任务；`delete_files=true` 时还要删除权限。
 
-```sh
-docker build -t autosync-symlink:arr-download .
-```
+## 部署
 
-下载代理需要与 Arr 位于同一 Compose 网络，入口为 `python -m bridge.arr_download --config /settings/arr-download.json --data-dir /data`。只绑定配置文件和私有数据目录；健康检查使用 `http://127.0.0.1:8097/healthz`。复用当前 HTPC 的 env 文件、PUID/PGID、host-gateway 设置。
-
-原生 CD2 和 host 网络 qB 必须能被**新代理容器**访问。已有仅针对 arr-import IP 放行的防火墙规则不会自动覆盖新容器。先验证 TCP 19798 / 8080 可达，再调整此服务的最小放行范围。
+[HTPC overlay](../deploy/arr-import.htpc.compose.yaml) 里有 `arr-download` 服务（只读根文件系统，只挂配置和数据目录，不需要 FUSE）。它要能访问宿主机的 CD2（`host.docker.internal:19798`），Arr 要能访问它（同一个 Compose 网络，`arr-download:8097`）。
 
 ```sh
 python -m bridge.arr_download --config /settings/arr-download.json --check
 ```
 
-初始使用独立测试分类。Arr 中增加 qB 类型的测试下载客户端，Host 为 `arr-download`，Port 为 `8097`，用户名 `arr-download`，密码为 ARR_DOWNLOAD_PASSWORD，分类填对应 offline-test 分类。保留原下载客户端。确认测试任务只送到新客户端后，再将 enabled 设为 true 并重启下载代理，手动选择单个公开 v1 种子。校验和入库期间不手动移动或改名其做种文件。
+Arr 设置：
 
-磁力需要能找到元数据来源；仅有 infohash、但无元数据节点的任务不能完成接种。115 离线状态成功后，还要逐项确认种子中的全部文件，包括 NFO、字幕等；文件名、目录、长度必须与原种子一致。目录结构不同或附属文件缺失时保持等待，最终超时，不猜测最大视频、不跳过校验。
+1. 下载客户端 → 添加 qBittorrent：Host `arr-download`，Port `8097`，用户名/密码同配置，Category 填 `categories` 里的一个。建议打开 Remove Completed。
+2. PT/私有索引器不能走 115 离线：在这些索引器的设置里把 Download Client 指定为原来的真实 qB，或者用标签把它们和离线客户端分开。代理收到私有种子会直接拒绝。
+3. 失败自动换种：在 `arr` 里填 Arr 地址和 API Key，并在 Arr 的 Download Clients → Failed Download Handling 里打开 Redownload。
 
-## Arr API 与任务恢复
+## 管理接口
 
-代理实现 Arr 使用的 qB v2 登录、版本、配置读取、分类、添加、种子列表、属性、文件、tracker、做种限制及开始/停止/移除操作，不是通用 qB WebUI 的完整替代。其他管理接口拒绝转发。首次添加后立即提供待处理任务属性，供 Arr 正常记录 downloadId。满足 `import_after` 后，代理向 Arr 提供完成的 115 下载交付视图，包括完成状态、文件清单及原始保存路径。真实 qB WebUI 保留其实际校验、做种进度；代理交付进度不表示 qB 已经完成校验。
+登录后（Cookie 或 Bearer）：
 
-代理暂停不保证暂停云盘服务端已经提交的离线下载。交付就绪前，取消会停止并移除代理拥有的 qB 任务，始终 `deleteFiles=false`；云端已提交任务和文件保留。交付就绪后，Arr 的移除操作只隐藏下载交付记录，保持后台 qB 任务；需要结束做种时在真实 qB 中管理。代理拒绝对托管任务使用 `deleteFiles=true`。已有同 hash 的普通 qB 种子不会被接管。失败、取消、重启都不自动删除云端文件或改变现有 qB 种子的保存路径。
+- `GET /v1/downloads`：全部任务的状态、进度、消息。
+- `GET /v1/downloads/<infohash>`：单个任务。
+- `POST /v1/downloads/<infohash>/retry`：重试失败任务；已提交过的直接回到下载中继续查询，不重复提交。
 
-使用代理登录后的 SID 访问：
+## 边界
 
-- `GET /v1/downloads/<40位hash>`：任务状态、阶段和无凭据错误信息；`delivery_status` 表示 waiting/ready/blocked/removed，`seeding_status` 表示后台接种阶段或失败，`qb_checked` 表示完整校验是否通过。Arr 清理交付记录后仍可查询后台任务。
-- `POST /v1/downloads/<40位hash>/retry`：恢复已有失败任务，保留离线提交意图。
-- `GET /v1/diagnostics`：qB 请求/失败计数、最近成功时间、最近错误的接口和阶段，以及应用信息缓存的年龄。仅输出脱敏信息；不查询媒体文件或创建任务。
-
-### qB 短时卡顿与 503
-
-`app/version`、`app/webapiVersion` 使用曾经真实读取成功的版本，缓存一小时；`app/preferences` 只缓存白名单设置五秒，不缓存认证字段。过期刷新遇到故障或另一个刷新仍在进行时，最多额外使用六十秒的旧值，响应头 `X-Arr-App-Cache: stale` 明确标记该情况。并发首次读取同一接口只发一个上游请求，失败后短暂退避三秒。无有效缓存时保留真实的 503；不会编造版本号。
-
-种子列表、文件完成度和写操作不使用这个缓存，qB 不可用时仍会明确报错，不会错误放行入库或做种。添加/开始/删除等请求丢失响应时不自动重放。`qb.timeout_seconds` 可选，默认十五秒，允许三到六十秒；修复不依赖增加默认超时时间。
-
-普通 qB 请求使用独立的线程 HTTP 处理器并共享认证 Cookie，仅登录/刷新认证串行，慢请求不再占用整个客户端的网络锁。队列渲染读取数据库快照，不等待后台持锁执行 CD2 操作。HTTP 监听队列为 128，以承受多个 Arr 实例的突发轮询。
-
-故障日志区分等待响应头和读取响应体，记录接口路径、异常类型和耗时，不打印请求参数、响应原文或凭据。`response_headers` 包含建立连接及等待响应头的时间，本身不能进一步证明是网络丢包或 qB 主线程阻塞；应与直连延迟、监听队列和系统负载一起判断。
-
-### CD2 的文件夹选项与原始种子布局
-
-qB 添加参数显式为 `contentLayout=Original`；核验同时使用原始 metainfo 和 qB 实际文件清单，不能靠更改全局布局选项猜测修正云端路径。
-
-CD2 网页包含“为每个文件创建文件夹”选项，其帮助文字针对上传文本文件时以文件名创建目录。当前公开的 `AddOfflineFileRequest` 只有 `urls`、`toFolder`、`checkFolderAfterSecs`，没有这个开关。此模块传递磁力链接，不上传文本列表；不要添加未核实的 protobuf 字段或假定网页选项能控制 API 的落盘布局。若 115 返回 `任务目录/视频.mkv/视频.mkv`，当前版本会等待目录与原种子对齐，不自动移动或删除云端文件。
-
-请求超时后先按 hash 查询 115 离线列表，避免盲目重复提交。若提交结果不确定且列表始终没有任务，不自动再次提交；需在 CD2 中核实并处理原离线任务，再重试。任务取消后不自动重新创建同 hash 任务。
-
-qB 完整校验需要读取全部数据，缓存未命中可能从 115 读取一遍。做种也会经 CD2 读取数据后使用本机上行上传。校验成功只能说明文件完整；实际上传速度和上传量还取决于云盘读取、本机上行及是否有下载者。
-
-## 验收与当前边界
-
-第一版支持公开、纯 BT v1、UTF-8 路径的单个磁力或 .torrent 请求，以及其中的单文件/多文件包。不接管 PT/private=1、v2/hybrid、符号链接、填充文件、下载时改名、选择性下载或批量 .torrent 请求。纯磁力只有取得元数据并确认非私有后，才提交 CD2 离线。HTTP .torrent URL 请由 Arr 获取种子后作为 multipart 上传。
-
-本地测试覆盖完整离线/校验/做种状态机、两种入库放行条件、交付清理后后台继续校验/做种、附属文件缺失、校验失败及重试、云端数据改变、暂停/取消、同 hash 冲突、重启及响应丢失恢复、接口鉴权和错误脱敏。网络接口在本机模拟服务验证。上线前仍需验证真实 qB stopped/metadata/recheck 状态变化、115 离线目录布局、完整包接种、Arr 完成入库及源文件保留。
-
-额外故障注入覆盖响应头/响应体超时、慢请求与队列读取隔离、并发 Cookie 过期只登录一次、冷缓存突发请求合并、有限旧值回退和恢复、无效 HTTP 200 响应不缓存、真实队列故障保留 503，以及写响应丢失不重复提交。已有发布版作为负对照时不能通过慢请求隔离测试。
-
-## 协议依据
-
-- [CloudDrive 官方 proto](https://www.clouddrive2.com/api/clouddrive.proto)：AddOfflineFiles、ListOfflineFilesByPath，离线完成状态为 2。
-- [qB 5.1.4 添加参数](https://github.com/qbittorrent/qBittorrent/blob/release-5.1.4/src/webui/api/torrentscontroller.cpp)：stopped、stopCondition、skip_checking、contentLayout。
-- [qB 停止条件](https://github.com/qbittorrent/qBittorrent/blob/release-5.1.4/src/base/bittorrent/torrent.h)：MetadataReceived、FilesChecked。
-- [qB stop 实现](https://github.com/qbittorrent/qBittorrent/blob/release-5.1.4/src/base/bittorrent/torrentimpl.cpp)：手动停止会清除 stopCondition。
-- [Radarr qB v2 客户端](https://github.com/Radarr/Radarr/blob/v6.4.4.10685/src/NzbDrone.Core/Download/Clients/QBittorrent/QBittorrentProxyV2.cs)。
-- [BEP 3](https://www.bittorrent.org/beps/bep_0003.html)：原始 info 字节的 infohash、文件集合和分块校验。
+- Arr 移除任务时，代理调用 `RemoveOfflineFiles`（`deleteFiles=false`）删掉 115 的离线记录：还在离线中的会停止，已有文件不受影响（文件只按 `delete_files` 处理）。这样以后重新抓同一个种子不会被 115 以“任务已存在”拒绝。
+- 提交时 115 已有同一 infohash 的离线记录（比如手动离线过），会被明确拒绝（CD2 报 gRPC 13，115 错误码 10008）。代理会删掉那条旧记录（不删文件）后重新提交一次；再被拒才报失败。
+- `torrents/topPrio` 回 409（相当于 qB 关闭了队列），Arr 会忽略；暂停、恢复、分享率限制等写操作接受但不起作用。
+- 只支持 BT v1 磁力和 .torrent；不支持 HTTP 种子 URL（Arr 会先下载种子再上传，不受影响）。

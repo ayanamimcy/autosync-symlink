@@ -52,6 +52,12 @@ class Store:
             self.db.execute("INSERT INTO imports VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status, body=excluded.body",
                             (job["id"], job["destination"], job["status"], json.dumps(job)))
 
+    def by_destination(self, destination):
+        with self.lock:
+            row = self.db.execute("SELECT body FROM imports WHERE destination=? ORDER BY rowid DESC LIMIT 1",
+                                  (destination,)).fetchone()
+            return json.loads(row[0]) if row else None
+
     def active(self):
         with self.lock:
             return [json.loads(r[0]) for r in self.db.execute("SELECT body FROM imports WHERE status NOT IN ('completed','failed') ORDER BY rowid")]
@@ -70,6 +76,20 @@ class Importer:
         self.thread = None
 
     def submit(self, request):
+        mode = request.get("transfer_mode", "copy")
+        if mode not in ("copy", "move"):
+            raise ValueError("transfer_mode 只能是 copy 或 move")
+        if mode == "move" and request.get("resume"):
+            # The hook lost track of a move whose source is already gone; find the job by its target.
+            mapped = route(self.config, request)
+            with self.lock:
+                job = self.store.by_destination(mapped["destination"])
+                if not job or job["source"] != mapped["source"] or job.get("mode") != "move":
+                    raise Conflict("源文件不存在，也没有可继续的云端移动任务")
+                if job["status"] == "completed":
+                    job.update(status="verifying_replay", started=self.clock())
+                    self.store.save(job)
+                return self.public(job)
         if (type(request.get("size")) is not int or request["size"] <= 0
                 or type(request.get("mtime_ns")) is not int or request["mtime_ns"] < 0
                 or not isinstance(request.get("download_id", ""), str)):
@@ -92,7 +112,7 @@ class Importer:
                     job["started"] = self.clock()
                     self.store.save(job)
                 return self.public(job)
-            job = {"id": job_id, "status": "waiting_upload", "request": canonical,
+            job = {"id": job_id, "status": "waiting_upload", "request": canonical, "mode": mode,
                    "source": mapped["source"], "destination": mapped["destination"],
                    "started": self.clock(), "errors": 0, "message": "等待云端上传完成"}
             try:
@@ -121,7 +141,7 @@ class Importer:
         return {k: job[k] for k in ("id", "status", "message") if k in job}
 
     def advance(self, job):
-        """One resumable step. Never read video bytes, overwrite or modify the source."""
+        """One resumable step. Never read video bytes or overwrite; the source moves only if Arr asked to move."""
         c = self.config
         if self.clock() - job["started"] > c["timeout_seconds"]:
             raise Conflict("等待或整理超时；确认上传状态后可重试")
@@ -140,10 +160,29 @@ class Importer:
             job.update(status="completed", message="目标已重新核验")
             return
         if final:
-            if job.get("publishing") and job.get("identity") and matches(final, job["identity"]):
-                job.update(status="completed", message="云端复制、改名和目标核验完成")
+            # Without a recorded identity, compare with the source as it is now (None while uploading).
+            expected = job.get("identity") or identity(cloud.get_file(source))
+            if expected and matches(final, expected):
+                job.update(identity=expected, status="completed",
+                           message="云端整理完成，目标已核验" if job.get("publishing")
+                           else "目标已是相同内容（大小和 SHA1 一致），无需再整理")
                 return
-            raise Conflict("目标文件已存在；不会覆盖或删除")
+            # Arr deletes the file being upgraded just before calling the script; through
+            # CD2 that deletion can take a moment to reach the provider.
+            job.setdefault("target_seen", self.clock())
+            if self.clock() - job["target_seen"] < c["target_wait_seconds"]:
+                job.update(status="waiting_target", message="目标位置已有文件；等待 Arr 删除旧文件生效")
+                return
+            raise Conflict("目标文件已存在且内容不同；不会覆盖或删除")
+        job.pop("target_seen", None)
+
+        stage = c["staging_root"] + "/" + job["id"]
+        original = stage + "/" + posixpath.basename(source)
+        renamed = stage + "/" + posixpath.basename(destination)
+        # After a cloud move the source is gone; continue from the staged file. A copy keeps
+        # checking that its source is unchanged first.
+        if job.get("mode") == "move" and job.get("identity") and self.publish_staged(job, cloud, original, renamed, destination):
+            return
 
         uploads = cloud.uploads(source)
         if any(u["state"] != 5 for u in uploads):
@@ -165,46 +204,52 @@ class Importer:
             job.update(status="waiting_upload", message="云端文件稳定性核验中")
             return
 
-        stage = c["staging_root"] + "/" + job["id"]
-        original = stage + "/" + posixpath.basename(source)
-        renamed = stage + "/" + posixpath.basename(destination)
         cloud.mkdir(stage, c["account_root"])
+        if self.publish_staged(job, cloud, original, renamed, destination):
+            return
+        if job.get("copy_requested"):
+            job.update(status="copying", message="等待 CD2 云端移动完成" if job.get("mode") == "move" else "等待 CD2 云端复制完成")
+            return
+        move = job.get("mode") == "move"
+        job.update(status="copying", copy_requested=True,
+                   message="已提交云端移动（Arr 要求移动）" if move else "已提交云端复制；源文件保留")
+        self.store.save(job)
+        try:
+            (cloud.move if move else cloud.copy)(source, stage)
+        except OperationRejected:
+            # Explicit rejection can be retried; an uncertain timeout cannot.
+            job["copy_requested"] = False
+            raise
+
+    def publish_staged(self, job, cloud, original, renamed, destination):
+        """Advance a verified staged file (rename, then publish). False if nothing is staged yet."""
+        c, fingerprint = self.config, job["identity"]
         named_file = cloud.get_file(renamed)
         if named_file:
             if not matches(named_file, fingerprint):
                 raise Conflict("暂存目标与源文件内容不符")
             if any(u["state"] != 5 for u in cloud.uploads(renamed)):
                 job.update(status="verifying", message="等待暂存文件完成")
-                return
+                return True
             target_dir = posixpath.dirname(destination)
             cloud.mkdir(target_dir, c["account_root"])
             # Persist intent BEFORE mutation: a timeout or restart may hide a successful move.
-            job.update(status="publishing", publishing=True, message="发布已核验的云端副本")
+            job.update(status="publishing", publishing=True, message="发布已核验的云端文件")
             self.store.save(job)
             cloud.move(renamed, target_dir)
-            return
+            return True
         staged = cloud.get_file(original) if original != renamed else None
         if staged:
             if not matches(staged, fingerprint):
-                raise Conflict("暂存副本的 SHA1 或大小不符")
+                raise Conflict("暂存文件的 SHA1 或大小不符")
             if any(u["state"] != 5 for u in cloud.uploads(original)):
-                job.update(status="verifying", message="等待暂存副本上传完成")
-                return
-            job.update(status="renaming", message="修改云端副本名称")
+                job.update(status="verifying", message="等待暂存文件上传完成")
+                return True
+            job.update(status="renaming", message="修改云端文件名称")
             self.store.save(job)
             cloud.rename(original, posixpath.basename(destination))
-            return
-        if job.get("copy_requested"):
-            job.update(status="copying", message="等待 CD2 云端复制完成")
-            return
-        job.update(status="copying", copy_requested=True, message="已提交云端复制；源文件保留")
-        self.store.save(job)
-        try:
-            cloud.copy(source, stage)
-        except OperationRejected:
-            # Explicit rejection can be retried; an uncertain timeout cannot.
-            job["copy_requested"] = False
-            raise
+            return True
+        return False
 
     def tick(self):
         for candidate in self.store.active():

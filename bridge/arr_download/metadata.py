@@ -36,9 +36,19 @@ def magnet(link):
     return hashes.pop()
 
 
-def offline_magnet(infohash):
-    # Never send tracker URLs or cookies to the offline provider.
-    return "magnet:?" + urlencode({"xt": "urn:btih:" + infohash})
+def magnet_parts(link):
+    """Display name and tracker URLs of a magnet link, used only to rebuild it."""
+    query = parse_qs(urlsplit(link).query)
+    return query.get("dn", [""])[0], [t for t in query.get("tr", []) if re.match(r"(?i)(https?|udp)://", t)]
+
+
+def offline_magnet(infohash, name="", trackers=()):
+    # Only the infohash, display name and public tracker URLs; no cookies or other parameters.
+    params = [("xt", "urn:btih:" + infohash)]
+    if name:
+        params.append(("dn", name))
+    params += [("tr", t) for t in trackers]
+    return "magnet:?" + urlencode(params)
 
 
 def metainfo(raw, allow_private=False):
@@ -101,18 +111,26 @@ def _metainfo(raw, allow_private):
     info = root[b"info"]
     if not isinstance(info, dict) or b"meta version" in info:
         raise ValueError("第一版离线模式仅支持纯 BT v1")
-    if not allow_private and info.get(b"private", 0) != 0:
-        raise ValueError("私有种子不交给 115 离线；请使用原 qB 下载器")
+    private = info.get(b"private", 0) != 0
+    if not allow_private and private:
+        raise ValueError("私有种子不交给 115 离线；请在 Arr 中让该索引器使用原 qB 下载器")
     name = relative(info[b"name"].decode("utf-8"))
     if "/" in name:
         raise ValueError("种子根名称不能包含子路径")
-    entries = []
+    entries, padding = [], 0
     if b"files" in info:
         if b"length" in info or not isinstance(info[b"files"], list):
             raise ValueError("种子文件列表无效")
         for row in info[b"files"]:
-            if not isinstance(row, dict) or row.get(b"attr") or b"symlink path" in row:
-                raise ValueError("第一版不支持种子填充文件或符号链接")
+            if not isinstance(row, dict):
+                raise ValueError("种子文件列表无效")
+            attr = row.get(b"attr", b"")
+            if b"p" in attr or b"l" in attr or b"symlink path" in row:
+                # BEP 47 padding files and symlinks carry no payload of their own.
+                if type(row.get(b"length")) is not int or row[b"length"] < 0:
+                    raise ValueError("种子填充文件长度无效")
+                padding += row[b"length"]
+                continue
             components = row[b"path"]
             if not isinstance(components, list) or not components:
                 raise ValueError("种子路径列表无效")
@@ -137,8 +155,17 @@ def _metainfo(raw, allow_private):
             parent = posixpath.dirname(parent)
     size = sum(row["size"] for row in entries)
     piece_length, pieces = info.get(b"piece length"), info.get(b"pieces")
+    span = size + padding
     if (not size or type(piece_length) is not int or not 0 < piece_length <= 64 * 1024**2
-            or not isinstance(pieces, bytes) or len(pieces) != 20 * ((size + piece_length - 1) // piece_length)):
+            or not isinstance(pieces, bytes) or len(pieces) != 20 * ((span + piece_length - 1) // piece_length)):
         raise ValueError("种子分块信息无效")
+    trackers = []
+    if not private:
+        announce = [root.get(b"announce", b"")] + [url for tier in root.get(b"announce-list", []) if isinstance(tier, list)
+                                                   for url in tier]
+        for url in announce:
+            url = url.decode("utf-8", "replace") if isinstance(url, bytes) else ""
+            if re.match(r"(?i)(https?|udp)://", url) and url not in trackers and len(trackers) < 20:
+                trackers.append(url)
     return {"hash": hashlib.sha1(raw[slice(*info_span)]).hexdigest(),
-            "name": name, "size": size, "files": entries}
+            "name": name, "size": size, "files": entries, "private": private, "trackers": trackers}

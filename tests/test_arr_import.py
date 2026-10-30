@@ -26,6 +26,7 @@ def config():
             "cloud": {"url": "http://127.0.0.1:19798", "token": "cloud-secret"},
             "account_root": "/115", "staging_root": "/115/.arr-import",
             "poll_seconds": 1, "settle_seconds": 2, "timeout_seconds": 100, "max_errors": 3,
+            "target_wait_seconds": 30,
             "rules": [{"id": "movies", "app": "radarr", "enabled": True,
                        "source_root": "/cloud/downloads", "destination_root": "/cloud/movies",
                        "cloud_source_root": "/115/downloads", "cloud_destination_root": "/115/movies"}]}
@@ -137,13 +138,48 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(self.cloud.calls, [])
         self.assertEqual(self.store.get(job_id)["status"], "waiting_upload")
 
-    def test_conflicting_target_never_overwritten_even_if_same_digest(self):
+    def test_existing_target_with_same_content_completes_without_copy(self):
         target = "/115/movies/Movie (2026)/Movie.mkv"
         self.cloud.files[target] = movie(target)
         job_id = self.submit()
         self.ticks(1)
+        self.assertEqual(self.store.get(job_id)["status"], "completed")
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_conflicting_target_waits_for_upgrade_delete_then_fails(self):
+        target = "/115/movies/Movie (2026)/Movie.mkv"
+        self.cloud.files[target] = movie(target, "c" * 40)
+        job_id = self.submit()
+        self.ticks(1)
+        self.assertEqual(self.store.get(job_id)["status"], "waiting_target")
+        self.time += self.cfg["target_wait_seconds"]
+        self.ticks(1)
         self.assertEqual(self.store.get(job_id)["status"], "failed")
         self.assertEqual(self.cloud.calls, [])
+
+    def test_target_deleted_by_arr_upgrade_is_then_published(self):
+        target = "/115/movies/Movie (2026)/Movie.mkv"
+        self.cloud.files[target] = movie(target, "c" * 40)
+        job_id = self.submit()
+        self.ticks(2)
+        del self.cloud.files[target]
+        self.ticks()
+        self.assertEqual(self.store.get(job_id)["status"], "completed")
+        self.assertEqual(self.cloud.files[target]["hashes"][2], "a" * 40)
+
+    def test_move_mode_moves_source_and_resumes_without_source(self):
+        job_id = self.imp.submit({**self.request, "transfer_mode": "move"})["id"]
+        self.ticks(2)
+        self.assertNotIn("/115/downloads/release.mkv", self.cloud.files)
+        self.ticks()
+        self.assertEqual(self.store.get(job_id)["status"], "completed")
+        self.assertEqual([c[0] for c in self.cloud.calls if c[0] != "mkdir"], ["move", "rename", "move"])
+        self.assertIn("/115/movies/Movie (2026)/Movie.mkv", self.cloud.files)
+        resumed = self.imp.submit({"app": "radarr", "source": self.request["source"],
+                                   "destination": self.request["destination"], "transfer_mode": "move", "resume": True})
+        self.assertEqual(resumed["id"], job_id)
+        with self.assertRaises(ValueError):
+            self.imp.submit({**self.request, "transfer_mode": "hardlink"})
 
     def test_restart_after_copy_and_lost_publish_response_recovers(self):
         job_id = self.submit()
@@ -328,6 +364,23 @@ class HookEnvironmentTests(unittest.TestCase):
                     self.assertEqual(payload["source"], self.source)
                     self.assertEqual(payload["destination"], self.destination)
                     self.assertEqual(payload["download_id"], "CaseSensitive-Torrent-ID")
+
+    def test_move_mode_is_forwarded_and_resumes_after_source_moved(self):
+        env = {"Radarr_SourcePath": self.source, "Radarr_DestinationPath": self.destination,
+               "Radarr_TransferMode": "Move"}
+        with patch.object(hook, "request", return_value={"status": "native"}) as request:
+            hook.run_hook(self.config, self.source, self.destination, env)
+        self.assertEqual(request.call_args.args[2]["transfer_mode"], "move")
+        Path(self.source).unlink()
+        Path(self.destination).parent.mkdir()
+        Path(self.destination).write_bytes(b"video")
+        with patch.object(hook, "request", return_value={"id": "1" * 64, "status": "completed"}) as request:
+            self.assertEqual(hook.run_hook(self.config, self.source, self.destination, env), "MoveComplete")
+        self.assertTrue(request.call_args.args[2]["resume"])
+        env["Radarr_TransferMode"] = "Copy"
+        with patch.object(hook, "request") as request, self.assertRaises(FileNotFoundError):
+            hook.run_hook(self.config, self.source, self.destination, env)
+        request.assert_not_called()
 
     def test_missing_ambiguous_conflicting_or_mismatched_environment_never_submits(self):
         valid = {"radarr_sourcepath": self.source, "radarr_destinationpath": self.destination}

@@ -2,7 +2,7 @@
 
 独立运行的可选模块。qB 继续下载到 CD2 挂载的 115 目录；Radarr/Sonarr 继续搜索、选种、识别媒体、生成名称和登记入库。只将导入时的视频复制和改名交给 CD2 API，保留 qB 源文件做种。
 
-第一阶段不包含 CD2 离线下载的 qB 兼容接口、已有媒体批量改名或媒体根目录迁移。它们后续可单独接入。参考 [115-media-automation](https://github.com/ayanamimcy/115-media-automation) 的 CloudDrive 调用方式，这里的流程入口改为 Arr 的 Import Using Script，不依赖原项目的搜索、同步、命名和自动导入循环。
+115 离线下载由独立的 [下载代理](ARR_DOWNLOAD.md) 提供，它下载到的文件同样经本模块入库。本模块不包含已有媒体批量改名或媒体根目录迁移。参考 [115-media-automation](https://github.com/ayanamimcy/115-media-automation) 的 CloudDrive 调用方式，这里的流程入口改为 Arr 的 Import Using Script，不依赖原项目的搜索、同步、命名和自动导入循环。
 
 ## 前置条件
 
@@ -98,7 +98,9 @@ Linux 示例用 `host.docker.internal:host-gateway` 访问原生 CD2。CD2 必�
 4. 两个 Arr 中启用高级设置，打开 Media Management → Importing → Import Using Script，将 Script Import Path 指向 `/config/scripts/arr_import.py`。Arr 自动传入源、目标两个参数。
 5. 保留 qB 下载器和 Completed Download Handling。媒体库根目录与下载暂存目录分开。
 
-hook 默认最多等待 180 秒，避免长期占用 Arr 导入流程；其超时后服务端任务仍保留。Arr 下次导入会复用相同任务，继续查询。只有远程核验成功、目标在 Arr 自己的挂载中可见且源大小/mtime 未改变，才输出 `[MoveStatus] MoveComplete`。
+hook 默认最多等待 180 秒，避免长期占用 Arr 导入流程；其超时后服务端任务仍保留。Arr 下次导入会复用相同任务，继续查询。只有远程核验成功、目标在 Arr 自己的挂载中可见（复制模式下还要源大小/mtime 未改变），才输出 `[MoveStatus] MoveComplete`。
+
+hook 读取 Arr 传入的 `TransferMode`：Arr 要求移动（Move，下载客户端不再需要这个文件，例如离线下载代理并打开了 Remove Completed）时，服务在云端移动源文件，不留副本；其余情况（Copy、HardLinkOrCopy）云端复制、保留源文件。移动后 hook 若超时重来，源文件已不在，hook 会按源和目标路径接上原任务。
 
 ## 故障恢复
 
@@ -116,7 +118,9 @@ python3 /config/scripts/arr_import.py --status 任务ID
 python3 /config/scripts/arr_import.py --retry 任务ID
 ```
 
-复制使用每个任务独享的 `staging_root/{任务ID}`；先核验副本大小与 SHA1，再改名，最后以 Skip 冲突策略放入正式目录。源文件永远保留。发布响应丢失时，可根据已持久化的发布意图和目标内容恢复；无法证明归属的既存目标会拒绝，即使其大小相同。
+复制（或移动）先进入每个任务独享的 `staging_root/{任务ID}`；核验大小与 SHA1，再改名，最后以 Skip 冲突策略放入正式目录。复制模式保留源文件。发布响应丢失时，可根据已持久化的发布意图和目标内容恢复。
+
+目标位置已有文件时：大小和 SHA1 与源一致就直接完成（内容相同，不再复制）；不一致时先等待 `target_wait_seconds`（默认 120 秒）——Arr 升级时会在调用脚本前删除旧文件，经 CD2 生效需要一点时间——旧文件消失就继续发布，到时仍在则失败，不覆盖、不删除。
 
 提交复制后不反复发起复制任务。响应超时、结果不确定时先等待；任务超时失败后，应检查 CD2 实际状态，再显式重试。源内容改变或目标冲突不自动覆盖。空的任务暂存目录会保留，确认完成后可手动清理；不要删除处理中的目录或丢弃 SQLite。
 
@@ -126,6 +130,6 @@ python3 /config/scripts/arr_import.py --retry 任务ID
 
 自动化测试使用模拟 CD2/115，真实 CD2 版本对 SHA1、上传状态、缓存可见性的行为尚需目标主机验收。缺少远程身份信息时应适配接口，不应放宽为只看大小。远程 SHA1 是提供商元数据，不读取本地视频计算摘要；也不将一次列表中没有上传任务视作上传已完成。
 
-整季包由 Sonarr 枚举每个文件，服务逐文件执行，不自行挑最大视频或猜集号。当前只接管主视频，字幕/NFO 等附属文件与时间、权限仍按 Arr 原生流程处理，可能读取少量挂载数据。已有媒体批量改名、目录迁移、升级旧文件删除、回收站行为不经本模块统一拦截；特别是升级时 Arr 可能在导入脚本之前处理旧文件，先使用新目标验收并保留原媒体备份。
+整季包由 Sonarr 枚举每个文件，服务逐文件执行，不自行挑最大视频或猜集号。当前只接管主视频，字幕/NFO 等附属文件与时间、权限仍按 Arr 原生流程处理，可能读取少量挂载数据。已有媒体批量改名、目录迁移、升级旧文件删除、回收站行为不经本模块统一拦截（升级时旧文件由 Arr 自己删除，本模块只等待删除生效）。
 
-qB 直接写挂载目录仍经过本机下载、缓存和上传。这里优化后续入库复制，不承诺整个下载链路零流量或云端每次操作都瞬间完成。
+qB 直接写挂载目录仍经过本机下载、缓存和上传；走 115 离线下载代理的任务不经过本机。
