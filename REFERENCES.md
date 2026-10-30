@@ -1,5 +1,7 @@
 # 接口文档与协议约定
 
+可选离线下载代理使用 AddOfflineFiles（urls=1、toFolder=2、checkFolderAfterSecs=3）和 ListOfflineFilesByPath（FileRequest.path=1）。OfflineFileListResult.offlineFiles=1，OfflineFile.infoHash=5、status=4，OFFLINE_FINISHED=2。与上传任务的 Finish=5 属于不同枚举。qB 接口按 release-5.1.4 的 torrentscontroller.cpp / torrent.h / torrentimpl.cpp 核对；其添加参数为 stopped（非旧版 paused）、stopCondition=MetadataReceived/FilesChecked、skip_checking=false，start/stop/recheck 使用 hashes。手动 stop 会清除停止条件，恢复未取得元数据的磁力时必须重新建立 MetadataReceived 条件。具体实现和验收边界见 docs/ARR_DOWNLOAD.md。
+
 独立 Arr 入库模块另外使用 GetSubFiles(forceRefresh=true)、GetUploadFileList(getAll=true)、CreateFolder、CopyFile、RenameFile、MoveFile。CopyFile/MoveFile 显式使用 conflictPolicy=Skip(2)，不使用默认 Overwrite(0)。CloudDriveFile 的 fileHashes 字段 70 为 map，Sha1 键为 2；上传 statusEnum 字段 8 的 Finish 为 5。代码只接受可核验的云端 ID、SHA1、大小及上传状态。
 
 - Radarr 导入脚本契约：https://github.com/Radarr/Radarr/blob/master/src/NzbDrone.Core/MediaFiles/ScriptImportDecider.cs
