@@ -313,6 +313,24 @@ class OfflineTests(Base):
         self.assertEqual(len([c for c in self.cloud.calls if c[0] == "add"]), 2)
         self.assertEqual(self.job(again["hash"])["status"], "queued")
 
+    def test_cleanup_failure_after_removal_never_fails_or_notifies_arr(self):
+        job = self.d.submit({"category": "radarr"}, torrent())
+        folder = "/115open/pt/download/.arr-offline/" + job["hash"]
+        self.ticks()
+        self.cloud.progress(folder, 2, 100.0)
+        self.cloud.land(folder, {"Show.S01E01.mkv": 3 * MB})
+        self.ticks(4, step=2)
+        self.d.remove([job["hash"]], delete_data=True)
+        with patch.object(self.cloud, "delete", side_effect=UpstreamError("CD2 DeleteFile：gRPC 7")):
+            self.ticks(5)
+        done = self.job(job["hash"])
+        self.assertEqual(done["status"], "ready")
+        self.assertFalse(done["remove_data"])
+        self.assertIn("删除权限", done["message"])
+        self.assertEqual(self.arr.failed, [])
+        self.ticks(2)
+        self.assertEqual(self.arr.failed, [])
+
     def test_remove_during_worker_pass_is_not_lost(self):
         job = self.d.submit({"category": "radarr"}, torrent())
         original = self.cloud.offline

@@ -164,7 +164,9 @@ class Downloader:
 
     # Worker ----------------------------------------------------------------
     def fail(self, job, message):
-        job.update(status="failed", message=message, notify=bool(self.instance(job)), notify_attempts=0)
+        # Arr no longer tracks a removed item: never mark its grab failed.
+        job.update(status="failed", message=message, notify=bool(self.instance(job)) and not job.get("removed"),
+                   notify_attempts=0)
 
     def instance(self, job):
         return next((i for i in self.config["arr"] if i["category"] == job["category"]), None)
@@ -263,6 +265,8 @@ class Downloader:
         if job.get("removed") and (job.get("submitted") or job.get("remove_data")):
             cloud = self.cloud_factory(self.config["cloud"])
             self.cleanup(job, cloud)
+        if job.get("notify") and job.get("removed"):
+            job["notify"] = False
         if job.get("notify"):
             self.notify(job)
         if job["status"] in ACTIVE and not job.get("removed"):
@@ -285,7 +289,12 @@ class Downloader:
                 detail = str(error) if type(error) in (ValueError, UpstreamError) else type(error).__name__
                 job["message"] = "暂时失败：" + detail
                 if job["errors"] >= self.config["max_errors"]:
-                    self.fail(job, "连续出错：" + detail)
+                    if cleanup:
+                        # Cleanup after Arr removed the item; the download itself is unaffected.
+                        job.update(remove_data=False, submitted=False, errors=0,
+                                   message="清理离线记录或目录失败，已放弃：" + detail + "（检查 CD2 令牌的删除权限）")
+                    else:
+                        self.fail(job, "连续出错：" + detail)
             else:
                 job["errors"] = 0
             self.persist(job, candidate)
