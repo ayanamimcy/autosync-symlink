@@ -104,6 +104,12 @@ class State:
                      (time.time(), status, result.get("seen", 0), result.get("change_count", 0),
                       result.get("deferred", 0), str(error) if error else "；".join(result.get("errors", [])[:3]), scan_id))
 
+    def last_full_scan_start(self, library):
+        """Start time of the latest whole-library scan that walked the tree (complete or partial)."""
+        rows = self.query("SELECT MAX(started) AS at FROM scans WHERE library=? AND scope='' "
+                          "AND status IN ('complete','partial')", (library,))
+        return rows[0]["at"]
+
     def scan_status(self, library):
         latest = self.query("SELECT * FROM scans WHERE library=? ORDER BY id DESC LIMIT 1", (library,))
         full = self.query("SELECT MAX(finished) AS at FROM scans WHERE library=? AND scope='' AND status='complete'", (library,))

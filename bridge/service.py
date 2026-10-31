@@ -394,9 +394,17 @@ class Service:
             previous = self.state.snapshot(lib["id"], root)
             self.state.save_snapshot(lib["id"], root, current)
             if previous is None:
-                continue  # first look: becomes the baseline
-            scopes = {name if value[2] else "" for name, value in current.items()
-                      if previous.get(name) != value and name.casefold() not in excluded}
+                # No snapshot yet: folders changed after the last full scan may never
+                # have been scanned (e.g. a missed push event). Without scan history
+                # the listing only becomes the baseline.
+                since = self.state.last_full_scan_start(lib["id"])
+                if since is None:
+                    continue
+                changed = {name: value for name, value in current.items() if value[0] > since * 1e9}
+            else:
+                changed = {name: value for name, value in current.items() if previous.get(name) != value}
+            scopes = {name if value[2] else "" for name, value in changed.items()
+                      if name.casefold() not in excluded}
             if self.config["sync"]["cleanup_enabled"] and set(previous) - set(current):
                 scopes.add("")
             for scope in sorted(scopes):
