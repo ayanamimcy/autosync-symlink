@@ -181,7 +181,7 @@ class ReconciliationTests(Fixture):
         service.perform = Mock(side_effect=performed)
         try:
             with patch("bridge.service.time.monotonic", return_value=100):
-                service.pending[("pt", "")] = 0
+                service.pending[("pt", "")] = {"due": 0, "since": 0, "reasons": {"测试"}}
                 service.run()
             service.perform.assert_called_once()
         finally:

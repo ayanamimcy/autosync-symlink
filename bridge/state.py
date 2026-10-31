@@ -28,6 +28,8 @@ class State:
           id INTEGER PRIMARY KEY, library TEXT, scope TEXT, started REAL, finished REAL,
           status TEXT, seen INTEGER DEFAULT 0, changes INTEGER DEFAULT 0,
           deferred INTEGER DEFAULT 0, error TEXT);
+        CREATE TABLE IF NOT EXISTS cloud_snapshots (
+          library TEXT, root TEXT, at REAL, body TEXT, PRIMARY KEY(library,root));
         ''')
         if "version" not in {x[1] for x in self.db.execute("PRAGMA table_info(notices)")}:
             self.db.execute("ALTER TABLE notices ADD COLUMN version INTEGER DEFAULT 0")
@@ -47,6 +49,15 @@ class State:
     def log(self, level, message):
         self.execute("INSERT INTO events(at,level,message) VALUES(?,?,?)", (time.time(),level,str(message)))
         self.execute("DELETE FROM events WHERE id < (SELECT COALESCE(MAX(id),0)-3000 FROM events)")
+
+    def snapshot(self, library, root):
+        """Top-level listing of a library's CD2 root from the last directory check."""
+        rows = self.query("SELECT body FROM cloud_snapshots WHERE library=? AND root=?", (library, root))
+        return json.loads(rows[0]["body"]) if rows else None
+
+    def save_snapshot(self, library, root, body):
+        self.execute("INSERT INTO cloud_snapshots VALUES(?,?,?,?) ON CONFLICT(library,root) DO UPDATE "
+                     "SET at=excluded.at, body=excluded.body", (library, root, time.time(), json.dumps(body)))
 
     def rows(self, library):
         return self.query("SELECT * FROM files WHERE library=?", (library,))

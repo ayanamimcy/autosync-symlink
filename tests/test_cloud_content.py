@@ -1,3 +1,4 @@
+import unittest
 """Real HTTP/gRPC-Web metadata copying without mounted-source file reads."""
 from contextlib import contextmanager
 from dataclasses import replace
@@ -26,6 +27,8 @@ class ContentTests(Fixture):
         self.lib["cloud_path"] = "/115open/pt"
         cooldowns = patch.object(CloudScanner, "_cooldowns", {})
         cooldowns.start(); self.addCleanup(cooldowns.stop)
+        delays = patch("bridge.cloud_content.RETRY_DELAYS", (0, 0, 0, 0, 0))
+        delays.start(); self.addCleanup(delays.stop)
         self.calls, self.gets, self.lock = [], [], threading.Lock()
         self.http_status, self.override_length, self.body_suffix = 200, None, b""
         self.omit_length, self.encoding, self.changed, self.no_proxy_url = False, "", False, False
@@ -267,3 +270,32 @@ class ContentTests(Fixture):
                 with self.subTest(target=target), self.assertRaises(CloudContentError):
                     reader.download(target, 8, lambda:None)
         connect.assert_not_called()
+
+
+class RetryTests(unittest.TestCase):
+    def content(self, retries):
+        from types import SimpleNamespace
+        from bridge.cloud_content import CloudContent
+        scanner = SimpleNamespace(config={"sync": {"metadata_max_mb": 1, "file_workers": 2, "metadata_retries": retries}},
+                                  workers=2, root="/115open/pt", interval=0)
+        return CloudContent(scanner)
+
+    def test_transient_failures_are_retried_others_are_not(self):
+        from types import SimpleNamespace
+        from bridge.cloud_content import CloudContentError
+        expected = SimpleNamespace(st_size=4, st_mtime_ns=1)
+        with patch("bridge.cloud_content.RETRY_DELAYS", (0, 0, 0, 0, 0)):
+            c = self.content(2)
+            replies = [CloudContentError("CD2 元数据下载失败（TimeoutError）；不回退挂载盘读取"), b"data"]
+            with patch.object(c, "fetch", side_effect=replies) as fetch:
+                self.assertEqual(c.read("a/b.nfo", expected, lambda: None), b"data")
+            self.assertEqual(fetch.call_count, 2)
+            with patch.object(c, "fetch", side_effect=CloudContentError("CD2 源文件仍在变动，保留原输出并等待下次校验")) as fetch:
+                with self.assertRaises(CloudContentError):
+                    c.read("a/b.nfo", expected, lambda: None)
+            self.assertEqual(fetch.call_count, 1)
+            timeout = CloudContentError("CD2 元数据下载失败（TimeoutError）；不回退挂载盘读取")
+            with patch.object(c, "fetch", side_effect=[timeout] * 3) as fetch:
+                with self.assertRaises(CloudContentError):
+                    c.read("a/b.nfo", expected, lambda: None)
+            self.assertEqual(fetch.call_count, 3)

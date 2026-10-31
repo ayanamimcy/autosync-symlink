@@ -27,7 +27,7 @@ function renderConfig(){
  const backendLabel=el('label','','扫描数据来源'),backend=el('select');
  for(const [value,label] of [['filesystem','挂载盘目录遍历'],['clouddrive','CloudDrive2 API']]){const option=el('option','',label);option.value=value;backend.append(option);}
  backend.value=cfg.sync.scan_backend;backend.addEventListener('change',()=>{cfg.sync.scan_backend=backend.value;});backendLabel.append(backend);$('#sync-config').append(backendLabel);
- for(const [key,label,min,max] of [['interval_seconds','定时全量扫描间隔（秒）',10,86400],['scan_workers','挂载盘目录扫描线程数',1,32],['cloud_list_workers','CD2 API 目录并发数',1,4],['cloud_list_interval_ms','CD2 API 请求最小间隔（毫秒）',100,60000],['file_workers','文件处理线程数',1,32]]){
+ for(const [key,label,min,max] of [['interval_seconds','定时全量扫描间隔（秒）',10,86400],['scan_workers','挂载盘目录扫描线程数',1,32],['cloud_list_workers','CD2 API 目录并发数',1,4],['cloud_list_interval_ms','CD2 API 请求最小间隔（毫秒）',100,60000],['file_workers','文件处理线程数',1,32],['cloud_check_seconds','CD2 目录变化检查间隔（秒，0 关闭）',0,86400],['metadata_retries','元数据下载超时重试次数',0,5]]){
   const f=field(label,cfg.sync[key],'number');f.input.min=String(min);f.input.max=String(max);f.input.step='1';f.input.required=true;
   f.input.addEventListener('input',()=>{cfg.sync[key]=Number(f.input.value);});$('#sync-config').append(f.label);
  }
@@ -79,7 +79,7 @@ $('#scan-all').addEventListener('click',()=>action('scan').catch(e=>toast(e.mess
 bindAction('#preview','preview');bindAction('#cleanup','cleanup','按当前清理策略清理托管文件？建议先预览。');bindAction('#initialize','initialize','将在已有的源目录中创建健康标记文件。确认初始化？');
 function renderStatus(s){
  let media=0,metadata=0;for(const r of s.managed){if(r.kind==='metadata')metadata+=r.count;else media+=r.count;}
- $('#media-count').textContent=media.toLocaleString();$('#metadata-count').textContent=metadata.toLocaleString();$('#cloud-state').textContent=s.cloud;$('#notice-count').textContent=s.pending_notifications;
+ $('#media-count').textContent=media.toLocaleString();$('#metadata-count').textContent=metadata.toLocaleString();$('#cloud-state').textContent=s.cloud+(s.push?' · 推送事件 '+s.push.received+'（命中 '+s.push.matched+'，忽略 '+s.push.ignored+'）':'');$('#cloud-state').title=[s.push&&s.push.last_at?'最近事件 '+formatTime(s.push.last_at):'',s.push&&s.push.ignored_samples.length?'忽略样例：'+s.push.ignored_samples.join('，'):'',s.cloud_check&&s.cloud_check.at?'目录检查 '+formatTime(s.cloud_check.at)+'（'+s.cloud_check.reason+'，安排 '+s.cloud_check.scheduled+' 个'+(s.cloud_check.error?'，失败 '+s.cloud_check.error:'')+'）':''].filter(Boolean).join('\n');$('#notice-count').textContent=s.pending_notifications;
  $('#worker-state').textContent=s.busy?'● '+(s.activity?.stage||'正在处理'):'● 服务就绪';$('#worker-state').title=s.activity?.path||'';$('#queue-count').textContent=s.pending_jobs+' 个等待';$('#libraries').replaceChildren();
  for(const lib of s.libraries){const n=$('#library-template').content.firstElementChild.cloneNode(true);n.querySelector('.name').textContent=lib.name;n.querySelector('.source').textContent=lib.source;n.querySelector('.output').textContent=lib.output;n.querySelector('.mode').textContent=(lib.enabled?lib.mode.toUpperCase():'已停用');
   const scan=lib.scan?.latest,full=lib.scan?.last_full_success;
@@ -98,7 +98,12 @@ function renderStatus(s){
   n.querySelector('.last').title='本次扫描的媒体和元数据文件；顶部数字为累计托管数。'+(live?.path?' 当前路径：'+live.path:'')+(scan?.error?' 扫描问题：'+scan.error:'');
   n.querySelector('.scan').disabled=!lib.enabled;n.querySelector('.scan').addEventListener('click',()=>action('scan',lib.id).catch(e=>toast(e.message)));n.querySelector('.preview').addEventListener('click',()=>{view('tools');$('#tool-library').value=lib.id;action('preview',lib.id).catch(e=>toast(e.message));});$('#libraries').append(n);
  }
- $('#jobs').replaceChildren();for(const j of [...s.jobs].reverse().slice(0,5)){const item=el('div','list-item'),c=el('div','list-content');c.append(el('span','list-title',({scan:'同步媒体库',cleanup:'清理托管文件',preview:'预览同步与清理',initialize:'初始化源标记',transfer_initialize:'初始化转存标记'})[j.action]||j.action),el('span','list-detail',formatTime(j.created)+(j.error?' · '+j.error:'')));item.append(el('span','badge',j.status),c);$('#jobs').append(item);}if(!s.jobs.length)$('#jobs').append(el('div','empty','还没有手动任务。后台会按配置自动同步。'));
+ $('#jobs').replaceChildren();
+ const actions={scan:'同步媒体库',cleanup:'清理托管文件',preview:'预览同步与清理',initialize:'初始化源标记',transfer_initialize:'初始化转存标记',config:'应用配置'};
+ const target=j=>[j.library,j.scope].filter(Boolean).join(' / ');
+ for(const w of s.waiting||[]){const item=el('div','list-item'),c=el('div','list-content');c.append(el('span','list-title','同步媒体库 · '+target(w)),el('span','list-detail',w.trigger+' · '+(w.due_in?'约 '+w.due_in+' 秒后开始':'即将开始')));item.append(el('span','badge','等待中'),c);$('#jobs').append(item);}
+ for(const j of [...s.jobs].reverse().slice(0,8)){const item=el('div','list-item'),c=el('div','list-content');const name=(actions[j.action]||j.action)+(target(j)?' · '+target(j):'');const done=(j.result||[]).map(r=>r.seen!==undefined?'扫描 '+r.seen+(r.changes!==undefined?'，变更 '+r.changes:''):'').filter(Boolean).join('；');c.append(el('span','list-title',name),el('span','list-detail',[(j.trigger||'手动'),formatTime(j.created),j.error||done].filter(Boolean).join(' · ')));item.append(el('span','badge',j.status),c);$('#jobs').append(item);}
+ if(!s.jobs.length&&!(s.waiting||[]).length)$('#jobs').append(el('div','empty','队列为空。CD2 文件通知、目录检查和定时扫描触发的任务也会显示在这里。'));
 }
 function renderLogs(){
  $('#logs').replaceChildren();for(const r of latestLogs.filter(x=>!$('#log-filter').value||x.level===$('#log-filter').value)){const tr=el('tr');const level=el('td');level.append(el('span','badge '+r.level,r.level));tr.append(el('td','',formatTime(r.at)),level,el('td','',r.message));$('#logs').append(tr);}

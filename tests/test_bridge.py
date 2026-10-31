@@ -409,8 +409,8 @@ class ServiceTests(Fixture):
     def test_debounce_and_root_collapse(self):
         s=self.make()
         try:
-            s.schedule('pt','A');first=s.pending[('pt','A')];s.schedule('pt','A')
-            self.assertEqual(s.pending[('pt','A')],first)
+            s.schedule('pt','A');first=s.pending[('pt','A')]['due'];s.schedule('pt','A')
+            self.assertEqual(s.pending[('pt','A')]['due'],first)
             s.schedule('pt');s.schedule('pt','B');self.assertEqual(list(s.pending),[('pt','')])
         finally:s.state.db.close()
     def test_live_config_cannot_retarget_managed_library(self):

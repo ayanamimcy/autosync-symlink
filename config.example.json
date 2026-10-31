@@ -38,7 +38,9 @@
     "scan_on_reconnect": true,
     "scan_backend": "filesystem",
     "cloud_list_workers": 2,
-    "cloud_list_interval_ms": 500
+    "cloud_list_interval_ms": 500,
+    "metadata_retries": 2,
+    "cloud_check_seconds": 600
   },
   "libraries": [
     {

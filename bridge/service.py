@@ -1,3 +1,4 @@
+import collections
 import copy
 import ntpath
 from pathlib import Path, PurePosixPath
@@ -6,6 +7,7 @@ import time
 import uuid
 
 from .cloud import CloudClient, CloudMonitor
+from .cloud_scan import CloudScanner
 from .config import atomic_json, load, validate
 from .engine import Engine
 from .notify import deliver
@@ -37,6 +39,12 @@ class Service:
         self.transfers = Transfers(self.state)
         self.monitor = self.new_monitor()
         self.native = self.new_native()
+        # CD2 push events: how many arrived and how many matched a library.
+        self.push = {"received": 0, "matched": 0, "ignored": 0, "last_at": None,
+                     "ignored_samples": collections.deque(maxlen=5)}
+        self.check_now, self.check_reason = threading.Event(), None
+        self.check_status = {"at": None, "reason": None, "scheduled": 0, "error": None}
+        self.checker = threading.Thread(target=self.check_run, name="cloud-check", daemon=True)
         self.thread = threading.Thread(target=self.run,name="media-worker",daemon=True)
         self.notifier = threading.Thread(target=self.notify_run,name="media-notifier",daemon=True)
 
@@ -44,7 +52,8 @@ class Service:
         return CloudMonitor(self.config["cloud"],self.change,self.monitor_ready(),self.state.log)
 
     def new_native(self):
-        return Monitor(self.config,self.schedule,self.state.log,ready=self.monitor_ready())
+        return Monitor(self.config, lambda lib, scope="": self.schedule(lib, scope, "目录监控"),
+                       self.state.log, ready=self.monitor_ready())
 
     def monitor_ready(self):
         # Connection readiness is distinct from actual file-change events.
@@ -54,34 +63,44 @@ class Service:
                 reconnect = library in seen
                 seen.add(library)
             setting = "scan_on_reconnect" if reconnect else "scan_on_startup"
+            if library is None:
+                # Changes made while the push stream was down produce no events.
+                self.request_check("推送重连后增量补扫" if reconnect else "推送连接后增量补扫")
             if not self.config["sync"][setting]:
                 self.state.log("INFO",f"{library or 'CloudDrive'} 通知已就绪；按 {setting}=false 跳过全量补扫")
                 return
             if library is None:
-                self.reconnected()
+                self.reconnected("推送重连后全量补扫" if reconnect else "启动全量补扫")
             else:
-                self.schedule(library)
+                self.schedule(library, "", "目录监控就绪")
         return ready
 
     def start(self):
         self.state.log("INFO","服务启动；等待源目录标记和 CloudDrive 配置")
         self.monitor.start(); self.native.start(); self.thread.start(); self.notifier.start()
+        self.checker.start()
 
-    def schedule(self, lib, scope=""):
+    def schedule(self, lib, scope="", reason="自动"):
+        """Queue an automatic scan; reasons of merged requests are kept for display."""
         with self.queue_lock:
-            key = (lib,scope)
+            def add(key, reasons):
+                entry = self.pending.setdefault(key, {"due": time.monotonic()+self.config["sync"]["debounce_seconds"],
+                                                      "since": time.time(), "reasons": set()})
+                entry["reasons"] |= reasons
             if (lib,"") in self.pending:
-                return
+                add((lib,""), {reason}); return
             if not scope or len([k for k in self.pending if k[0]==lib]) >= 64:
-                self.pending = {k:v for k,v in self.pending.items() if k[0] != lib}
-                key = (lib,"")
-            self.pending.setdefault(key,time.monotonic()+self.config["sync"]["debounce_seconds"])
+                merged = {reason}
+                for key in [k for k in self.pending if k[0]==lib]:
+                    merged |= self.pending.pop(key)["reasons"]
+                add((lib,""), merged); return
+            add((lib,scope), {reason})
 
-    def reconnected(self):
+    def reconnected(self, reason="定时全量扫描"):
         # The monitor thread must not wait for the worker's long scan lock.
         for lib in self.config["libraries"]:
             if lib["enabled"]:
-                self.schedule(lib["id"])
+                self.schedule(lib["id"], "", reason)
 
     def discover(self):
         libs = [x for x in self.config["libraries"] if x["enabled"]]
@@ -109,19 +128,28 @@ class Service:
             self.state.log("WARN",f"挂载映射未读取 ({type(e).__name__})；可手填 cloud_path；未知映射的事件将触发该库补扫")
 
     def change(self, event):
+        self.push["received"] += 1
+        self.push["last_at"] = time.time()
+        matched = False
         for lib in self.config["libraries"]:
             if not lib["enabled"]:
                 continue
             cp = self.cloud_paths.get(lib["id"])
             if cp is None:
-                self.schedule(lib["id"]); continue
+                self.schedule(lib["id"], "", "CD2 文件通知（库映射未知）"); matched = True; continue
             for p in (event["path"],event["new_path"]):
                 if not p or ".." in p.split("/") or "\\" in p:
                     continue
                 if p == cp or p.startswith(cp+"/"):
                     rel = p[len(cp):].lstrip("/")
                     scope = str(PurePosixPath(rel).parent)
-                    self.schedule(lib["id"],"" if scope=="." else scope)
+                    self.schedule(lib["id"],"" if scope=="." else scope, "CD2 文件通知")
+                    matched = True
+        if matched:
+            self.push["matched"] += 1
+        else:
+            self.push["ignored"] += 1
+            self.push["ignored_samples"].append(event["path"] or event["new_path"])
 
     def submit(self, action, library=None, **options):
         if action not in ("scan","cleanup","preview","initialize","transfer_initialize"):
@@ -130,13 +158,17 @@ class Service:
             if len(self.queue) >= 20:
                 raise ValueError("任务队列已满，请等待当前任务完成")
             key = uuid.uuid4().hex
-            self.jobs[key] = {"id":key,"action":action,"status":"排队中","created":time.time()}
+            self.jobs[key] = {"id":key,"action":action,"status":"排队中","created":time.time(),
+                              "trigger":"手动","library":library or "","scope":options.get("scope","")}
             self.queue.append((key,action,library,options))
-            if len(self.jobs)>100:
-                for old in list(self.jobs):
-                    if self.jobs[old]["status"] in ("完成","失败"):
-                        self.jobs.pop(old); break
+            self.prune_jobs()
             return copy.deepcopy(self.jobs[key])
+
+    def prune_jobs(self):
+        # Caller holds queue_lock. Keep the newest 100 records; never drop live ones.
+        finished = [k for k, j in self.jobs.items() if j["status"] in ("完成", "失败")]
+        while len(self.jobs) > 100 and finished:
+            self.jobs.pop(finished.pop(0))
 
     def submit_config(self, config):
         # HTTP requests must not wait for the worker's long-running scan lock.
@@ -149,13 +181,10 @@ class Service:
             if len(self.queue) >= 20:
                 raise ValueError("任务队列已满，请等待当前任务完成")
             key = uuid.uuid4().hex
-            self.jobs[key] = {"id":key, "action":"config", "status":"排队中", "created":time.time()}
+            self.jobs[key] = {"id":key, "action":"config", "status":"排队中", "created":time.time(), "trigger":"手动"}
             # Apply before the next scan, without interrupting the current one.
             self.queue.insert(0, (key, "config", None, {"config":config}))
-            if len(self.jobs) > 100:
-                for old in list(self.jobs):
-                    if self.jobs[old]["status"] in ("完成", "失败"):
-                        self.jobs.pop(old); break
+            self.prune_jobs()
             return copy.deepcopy(self.jobs[key])
 
     def libs(self, library=None):
@@ -214,7 +243,7 @@ class Service:
                 if result["deferred"]:
                     # A fresh create event can arrive before the settling window.
                     # Retry soon instead of waiting for the 15-minute fallback scan.
-                    self.schedule(lib["id"],options.get("scope",""))
+                    self.schedule(lib["id"],options.get("scope",""), "延迟重试（文件尚未稳定）")
         return results
 
     def progress(self, stage, path):
@@ -252,7 +281,7 @@ class Service:
             self.native.start()
             self.discover()
             if self.config["sync"]["scan_on_startup"]:
-                self.reconnected()
+                self.reconnected("应用配置后全量扫描")
             self.state.log("INFO","配置已保存并应用；Web 监听地址或端口变化需重启")
 
     def run(self):
@@ -265,21 +294,26 @@ class Service:
                     if now >= next_discover:
                         self.discover(); next_discover = now+300
                     if now >= next_scan:
-                        self.reconnected(); next_scan = now+self.config["sync"]["interval_seconds"]
+                        self.reconnected("定时全量扫描"); next_scan = now+self.config["sync"]["interval_seconds"]
                     item = None
                     with self.queue_lock:
                         if self.queue:
                             item = self.queue.pop(0)
-                        due = [(k,v) for k,v in self.pending.items() if v <= now]
+                        due = [(k,v) for k,v in self.pending.items() if v["due"] <= now]
                         if not item and due:
-                            (library,scope),_ = due[0]
+                            (library,scope),entry = due[0]
                             self.pending.pop((library,scope))
-                            item = (None,"scan",library,{"scope":scope,"cleanup":self.config["sync"]["cleanup_enabled"]})
+                            key = uuid.uuid4().hex
+                            self.jobs[key] = {"id":key,"action":"scan","status":"排队中","created":entry["since"],
+                                              "trigger":"、".join(sorted(entry["reasons"])),"library":library,
+                                              "scope":scope,"auto":True}
+                            self.prune_jobs()
+                            item = (key,"scan",library,{"scope":scope,"cleanup":self.config["sync"]["cleanup_enabled"]})
                     if item:
                         key, action, library, options = item
                         self.busy = True
                         if key:
-                            self.jobs[key]["status"] = "运行中"
+                            self.jobs[key].update(status="运行中", started=time.time())
                         try:
                             if action == "config":
                                 self.save_config(options["config"])
@@ -288,14 +322,18 @@ class Service:
                             else:
                                 result = self.perform(action,library,**options)
                             if key:
-                                self.jobs[key].update(status="完成",result=result)
+                                if self.jobs[key].get("auto"):
+                                    # Keep automatic records small: they are frequent.
+                                    result = [{k: v for k, v in r.items() if isinstance(v, (int, float, bool))}
+                                              for r in result]
+                                self.jobs[key].update(status="完成",result=result,finished=time.time())
                         except Exception as e:
                             message = str(e)
                             self.state.log("ERROR",f"{action}: {message}")
                             if key:
-                                self.jobs[key].update(status="失败",error=message)
-                            elif isinstance(e,OSError):
-                                self.schedule(library,options.get("scope",""))
+                                self.jobs[key].update(status="失败",error=message,finished=time.time())
+                            if key and self.jobs[key].get("auto") and isinstance(e,OSError):
+                                self.schedule(library,options.get("scope",""), "出错重试")
                         finally:
                             self.busy = False
                             self.activity = None
@@ -304,13 +342,67 @@ class Service:
                             if task["enabled"]:
                                 try:
                                     if self.transfers.scan(task):
-                                        self.reconnected()
+                                        self.reconnected("转存后补扫")
                                 except Exception as e:
                                     self.state.log("WARN",f"转存 {task['id']}: {e}")
                         next_transfer = now+15
             except Exception as e:
                 self.state.log("ERROR",f"后台任务异常 ({type(e).__name__})")
             self.stop_event.wait(0.5)
+
+    def request_check(self, reason):
+        self.check_reason = reason
+        self.check_now.set()
+
+    def check_run(self):
+        reason = "启动后目录检查"
+        while not self.stop_event.is_set():
+            seconds = self.config["sync"]["cloud_check_seconds"]
+            if self.config["cloud"]["enabled"] and seconds:
+                try:
+                    self.cloud_check(reason)
+                except Exception as e:
+                    if not self.check_status.get("error"):
+                        self.state.log("WARN", f"CD2 目录变化检查失败 ({type(e).__name__})；下次继续")
+                    self.check_status = {**self.check_status, "at": time.time(), "reason": reason,
+                                         "error": type(e).__name__}
+            self.check_now.wait(seconds or 300)
+            reason = (self.check_reason or "按需目录检查") if self.check_now.is_set() else "定期目录检查"
+            self.check_now.clear(); self.check_reason = None
+
+    def cloud_check(self, reason):
+        """Compare each library's CD2 root listing with the stored snapshot and scan what changed.
+
+        Only direct children are compared: a new or changed top-level folder is scanned.
+        Changes deeper down that do not touch the top-level folder's time are left to
+        push events and the periodic full scan.
+        """
+        url = self.config["cloud"]["url"]
+        if CloudScanner._cooldowns.get(url, 0) > time.monotonic():
+            return  # CD2 rate-limit cooldown from a scan
+        client = CloudClient(self.config["cloud"])
+        token = client.token()
+        excluded = {x.casefold() for x in self.config["sync"]["exclude_directories"]}
+        scheduled = 0
+        for lib in self.config["libraries"]:
+            root = (self.cloud_paths.get(lib["id"]) or lib["cloud_path"] or "").rstrip("/")
+            if not lib["enabled"] or not root:
+                continue
+            # force_refresh: changes made through another CD2 (e.g. the Arr host) are not in this cache.
+            current = {e.name: [e.mtime_ns, e.size, e.directory]
+                       for e in client.list_files(root, token, force_refresh=True)}
+            previous = self.state.snapshot(lib["id"], root)
+            self.state.save_snapshot(lib["id"], root, current)
+            if previous is None:
+                continue  # first look: becomes the baseline
+            scopes = {name if value[2] else "" for name, value in current.items()
+                      if previous.get(name) != value and name.casefold() not in excluded}
+            if self.config["sync"]["cleanup_enabled"] and set(previous) - set(current):
+                scopes.add("")
+            for scope in sorted(scopes):
+                self.schedule(lib["id"], scope, reason)
+            scheduled += len(scopes)
+        self.check_status = {"at": time.time(), "reason": reason, "scheduled": scheduled, "error": None}
 
     def notify_run(self):
         while not self.stop_event.is_set():
@@ -327,6 +419,10 @@ class Service:
         with self.queue_lock:
             jobs = copy.deepcopy(list(self.jobs.values())[-20:])
             pending = len(self.pending)+len(self.queue)
+            now = time.monotonic()
+            waiting = sorted(({"library": k[0], "scope": k[1], "trigger": "、".join(sorted(v["reasons"])),
+                               "since": v["since"], "due_in": max(0, round(v["due"] - now))}
+                              for k, v in self.pending.items()), key=lambda x: x["due_in"])
         native = self.native.summary()
         cloud = ((native+"；"+self.monitor.status) if self.config["cloud"]["enabled"] else native) if native else self.monitor.status
         return {"cloud":cloud,"native_watch":native,"grpc":self.monitor.status,"busy":self.busy,"activity":self.activity,"pending_jobs":pending,
@@ -336,12 +432,17 @@ class Service:
                               "output":x["output"],"mode":x["mode"],"cloud_path":self.cloud_paths.get(x["id"]),
                               "last":self.last_results.get(x["id"]),"scan":self.state.scan_status(x["id"]),
                               "progress":live_progress.get(x["id"])} for x in self.config["libraries"]],
-                "jobs":jobs}
+                "jobs":jobs, "waiting":waiting,
+                "push":{**{k: v for k, v in self.push.items() if k != "ignored_samples"},
+                        "ignored_samples": list(self.push["ignored_samples"])},
+                "cloud_check":dict(self.check_status)}
 
     def stop(self):
-        self.stop_event.set(); self.monitor.stop(); self.native.stop()
+        self.stop_event.set(); self.check_now.set(); self.monitor.stop(); self.native.stop()
         if self.thread.is_alive():
             self.thread.join(timeout=5)
         if self.notifier.is_alive():
             self.notifier.join(timeout=2)
+        if self.checker.is_alive():
+            self.checker.join(timeout=2)
         self.state.log("INFO","服务已停止")

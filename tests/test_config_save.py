@@ -34,7 +34,7 @@ class ConfigSaveTests(Fixture):
                     raise TimeoutError('test scan was not released')
             return []
         service.schedule('pt')
-        service.pending[('pt', '')] = 0
+        service.pending[('pt', '')] = {"due": 0, "since": 0, "reasons": {"测试"}}
         with patch.object(service, 'perform', side_effect=perform):
             service.thread.start()
             self.assertTrue(entered.wait(2))

@@ -15,6 +15,13 @@ class CloudContentError(Exception):
     pass
 
 
+# Failures worth another attempt: the network or CD2 dropped the transfer. Rate
+# limits, size limits and files still changing are not retried here.
+TRANSIENT = re.compile(r"Timeout|timed out|ConnectionResetError|ConnectionAbortedError|RemoteDisconnected"
+                       r"|IncompleteRead|BrokenPipeError|响应不完整")
+RETRY_DELAYS = (5, 15, 30, 60, 60)
+
+
 class CloudContent:
     def __init__(self, scanner):
         self.scanner = scanner
@@ -107,6 +114,19 @@ class CloudContent:
         if not 0 <= expected.st_size <= self.limit:
             raise CloudContentError("CD2 元数据超过大小限制，已跳过")
         path = virtual_path(posixpath.join(self.scanner.root, *parts))
+        retries = self.config["sync"].get("metadata_retries", 0)
+        for attempt in range(retries + 1):
+            try:
+                return self.fetch(path, expected, checkpoint)
+            except CloudContentError as error:
+                if attempt == retries or not TRANSIENT.search(str(error)):
+                    raise
+            deadline = time.monotonic() + RETRY_DELAYS[attempt]
+            while time.monotonic() < deadline:
+                checkpoint()  # stays interruptible on shutdown
+                time.sleep(.2)
+
+    def fetch(self, path, expected, checkpoint):
         with self.slots:
             self.wait_start(checkpoint)
             # Explicitly request a full original file via the CD2 proxy.

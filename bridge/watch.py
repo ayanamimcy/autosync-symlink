@@ -71,15 +71,23 @@ class Monitor:
             from .native_watch import NativeMonitor
             self.impl = NativeMonitor(config["libraries"], callback, log, ready=ready)
             return
+        libraries = [lib for lib in config["libraries"] if lib["enabled"]]
         if mode == "auto" and sys.platform == "linux":
             from .linux_watch import InotifyWatch
+            from .mounts import filesystem_type
+            # FUSE mounts (CloudDrive2 and similar) do not deliver inotify events for
+            # changes made elsewhere and reject watches; rely on CD2 push and checks.
+            fuse = [lib for lib in libraries if (filesystem_type(lib["source"]) or "").startswith("fuse")]
+            libraries = [lib for lib in libraries if lib not in fuse]
             self.kind = "Linux inotify"
+            if fuse:
+                self.kind += f"（{len(fuse)} 个库在 FUSE/CD2 挂载上，不用 inotify，靠 CD2 推送和目录检查）"
             factory = lambda lib: InotifyWatch(lib, callback, log, config["sync"]["exclude_directories"], ready=ready)
         else:
             self.kind = "目录轮询（非云端实时保证）"
             factory = lambda lib: PollingWatch(lib, callback, log, config["sync"]["watch_poll_seconds"],
                                              config["sync"]["exclude_directories"], ready=ready)
-        self.watchers = [factory(lib) for lib in config["libraries"] if lib["enabled"]]
+        self.watchers = [factory(lib) for lib in libraries]
 
     def start(self):
         if self.impl:

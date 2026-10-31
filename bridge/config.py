@@ -18,7 +18,8 @@ DEFAULT = {
              "cleanup_enabled": False, "watch_mode": "auto", "watch_poll_seconds": 30,
              "metadata_verify_seconds": 3600,
              "delete_grace_seconds": 3600, "max_delete_fraction": 0.2,
-             "allow_empty_cleanup": False, "metadata_max_mb": 32,
+             "allow_empty_cleanup": False, "metadata_max_mb": 32, "metadata_retries": 2,
+             "cloud_check_seconds": 600,
              "exclude_directories": ["_trash", ".deletedByTMM", ".Trash", "$RECYCLE.BIN", "System Volume Information", "@Recycle", "#recycle"]},
     "libraries": [{"id": "pt", "name": "PT 媒体库", "enabled": False,
                    "source": "/mnt/clouddrive/pt", "output": "/srv/media/library/pt",
@@ -114,9 +115,12 @@ def validate(c, data_dir=None):
                             ("metadata_max_mb", 1, 256), ("watch_poll_seconds", 1, 86400),
                             ("metadata_verify_seconds", 0, 604800),
                             ("scan_workers", 1, 32), ("file_workers", 1, 32),
-                            ("cloud_list_workers", 1, 4), ("cloud_list_interval_ms", 100, 60000)]:
+                            ("cloud_list_workers", 1, 4), ("cloud_list_interval_ms", 100, 60000),
+                            ("metadata_retries", 0, 5), ("cloud_check_seconds", 0, 86400)]:
         if not integer(c["sync"][key], low, high):
             raise ValueError(f"{key} 必须是 {low}–{high} 之间的整数")
+    if 0 < c["sync"]["cloud_check_seconds"] < 60:
+        raise ValueError("cloud_check_seconds 为 0（关闭）或 60–86400")
     if type(c["sync"]["max_delete_fraction"]) not in (int, float) or not 0 < c["sync"]["max_delete_fraction"] <= 1:
         raise ValueError("max_delete_fraction 应大于 0 且不大于 1")
     if type(c["sync"]["allow_empty_cleanup"]) is not bool:
@@ -219,7 +223,8 @@ def load(path):
     # Only migrate fields introduced by this version; unknown fields still fail validation.
     for key in ("cleanup_enabled", "watch_mode", "watch_poll_seconds", "metadata_verify_seconds",
                 "scan_workers", "file_workers", "scan_on_startup", "scan_on_reconnect",
-                "scan_backend", "cloud_list_workers", "cloud_list_interval_ms"):
+                "scan_backend", "cloud_list_workers", "cloud_list_interval_ms",
+                "metadata_retries", "cloud_check_seconds"):
         config.get("sync", {}).setdefault(key, DEFAULT["sync"][key])
     for lib in config.get("libraries", []):
         lib.setdefault("mount_root", ""); lib.setdefault("output_mount_root", "")

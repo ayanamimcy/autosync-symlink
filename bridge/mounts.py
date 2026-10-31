@@ -32,3 +32,21 @@ def identities(lib):
 def assert_unchanged(lib, previous):
     if identities(lib) != previous:
         raise OSError("扫描期间挂载身份发生变化，已停止本次操作")
+
+
+def filesystem_type(path, mountinfo=None):
+    """Filesystem type of the mount containing path, or None when it cannot be determined."""
+    target = str(Path(path).absolute())
+    try:
+        text = Path("/proc/self/mountinfo").read_text() if mountinfo is None else mountinfo
+    except OSError:
+        return None
+    best, kind = "", None
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 10 or "-" not in fields:
+            continue
+        point = unescape(fields[4])
+        if (target == point or target.startswith(point.rstrip("/") + "/")) and len(point) >= len(best):
+            best, kind = point, fields[fields.index("-") + 1]
+    return kind
