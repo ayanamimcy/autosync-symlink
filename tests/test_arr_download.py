@@ -137,6 +137,7 @@ class Base(unittest.TestCase):
         self.time = 1000.0
         self.cfg = config()
         self.d = Downloader(self.cfg, self.store, lambda _: self.cloud, self.arr, lambda: self.time)
+        self.addCleanup(lambda: self.d.warm_pool and self.d.warm_pool.shutdown(wait=True))
 
     def ticks(self, n=1, step=1):
         for _ in range(n):

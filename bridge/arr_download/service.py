@@ -109,7 +109,7 @@ class Downloader:
         self.thread = None
         self.extra_categories = set()
         self.warmers = {}  # infohash -> Future of the background pre-read
-        self.warm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="arr-warm")
+        self.warm_pool = None  # created on first use, only when pre-read is enabled
 
     # Paths -----------------------------------------------------------------
     def folder(self, infohash):
@@ -282,6 +282,8 @@ class Downloader:
             def run():
                 for path, size in videos:
                     warm_file(path, size, w["head_mb"] * LARGE, w["tail_mb"] * LARGE)
+            if self.warm_pool is None:
+                self.warm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="arr-warm")
             self.warmers[job["hash"]] = self.warm_pool.submit(run)
             job["message"] = f"预读视频文件头尾（第 {job['warm_attempts']} 次）"
             return
@@ -387,7 +389,8 @@ class Downloader:
 
     def close(self):
         self.stop.set()
-        self.warm_pool.shutdown(wait=False, cancel_futures=True)
+        if self.warm_pool:
+            self.warm_pool.shutdown(wait=False, cancel_futures=True)
         if self.thread:
             self.thread.join(timeout=60)
 
