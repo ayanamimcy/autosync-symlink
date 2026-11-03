@@ -54,6 +54,9 @@
       "cloud_path": "/115/pt/movie",
       "mode": "symlink",
       "strm_prefix": "",
+      "strm_target": "path",
+      "strm_base_url": "",
+      "strm_preview": true,
       "sentinel": ".media-bridge-ready"
     },
     {
@@ -67,6 +70,9 @@
       "cloud_path": "/115/pt/tv",
       "mode": "symlink",
       "strm_prefix": "",
+      "strm_target": "path",
+      "strm_base_url": "",
+      "strm_preview": true,
       "sentinel": ".media-bridge-ready"
     },
     {
@@ -80,6 +86,9 @@
       "cloud_path": "/115/pt/bangumi",
       "mode": "symlink",
       "strm_prefix": "",
+      "strm_target": "path",
+      "strm_base_url": "",
+      "strm_preview": true,
       "sentinel": ".media-bridge-ready"
     }
   ],

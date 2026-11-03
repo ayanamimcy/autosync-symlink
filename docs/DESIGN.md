@@ -41,3 +41,5 @@ API 元数据通过 CloudContent 获取：GetDownloadUrlPath 明确 preview=fals
 元数据下载并发为 min(file_workers, cloud_list_workers)，任务开始通过 cloud_list_interval_ms 节流，等候和网络请求之间保留停止/挂载检查点。声明长度须与清单一致；未声明长度的响应读取至预期大小加一字节，仍受 metadata_max_mb 限制；拒绝压缩或不完整响应。下载后 FindFileByPath 查询原文件，核对类型、路径、大小、纳秒时间，再进入原有哈希、所有权、原子替换和清单事务。API 属性缓存策略不变，校验不是云端事务快照保证。
 
 元数据失败独立记录并保持旧输出/清单，不回退源挂载；HTTP 429 与 gRPC 状态 8 共用目录扫描的 60 秒冷却，后续元数据任务在请求前检查。文件未变化且未到验证周期时不获取下载地址；到周期仍会下载内容校验，预览始终跳过内容读取。
+
+STRM 可选 `strm_target=clouddrive`：内容为 CD2 代理下载地址 `{base}/static/{scheme}/{host}/{preview}/{quote(虚拟路径去掉开头 /, safe="")}`，与 GetDownloadUrlPath 返回的模板布局相同，但不调用 API、不写 Token，也不使用网盘直链。虚拟根按 `cloud_path` → 挂载映射 → API 扫描根的顺序取得，扫描开始时确定，取不到则在写入前失败。签名为 `cd2:` 加地址前缀与虚拟根，切换目标或地址会重写托管的 STRM；`path` 模式签名与旧版本相同，升级不会重写已有 STRM。

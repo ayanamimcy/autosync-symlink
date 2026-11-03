@@ -228,6 +228,68 @@ class EngineTests(Fixture):
         self.lib['mode']='strm'; movie=self.file('Movie.mkv'); self.engine.scan(self.lib)
         self.assertEqual((self.output/'Movie.strm').read_text(),str(movie)+'\n')
 
+    def test_cd2_strm_matches_cd2_play_url(self):
+        # Sample URL taken from a working CD2 playback link.
+        self.config['cloud']['url'] = 'http://100.78.216.82:19798'
+        self.lib.update(mode='strm', strm_target='clouddrive', cloud_path='/115open/云下载')
+        name = 'Angels.&.Demons.2009.4K.HDR.DV.2160p.BDRemux Ita Eng x265-NAHOM'
+        self.file(f'{name}/{name}.mkv')
+        result = self.engine.scan(self.lib)
+        self.assertEqual(result['change_count'], 1); self.assertFalse(result['errors'])
+        self.assertEqual((self.output/name/f'{name}.strm').read_text(),
+                         'http://100.78.216.82:19798/static/http/100.78.216.82:19798/true/115open%2F%E4%BA%91%E4%B8%8B%E8%BD%BD'
+                         '%2FAngels.%26.Demons.2009.4K.HDR.DV.2160p.BDRemux%20Ita%20Eng%20x265-NAHOM'
+                         '%2FAngels.%26.Demons.2009.4K.HDR.DV.2160p.BDRemux%20Ita%20Eng%20x265-NAHOM.mkv\n')
+        self.assertEqual(self.engine.scan(self.lib)['change_count'], 0)
+
+    def test_cd2_strm_base_url_and_preview_false(self):
+        self.lib.update(mode='strm', strm_target='clouddrive', cloud_path='/115/pt/',
+                        strm_base_url='https://media.example:8443/cd2/', strm_preview=False)
+        self.file('Movie #1.mkv'); self.file('Movie #1.nfo', b'<movie/>')
+        self.engine.scan(self.lib)
+        self.assertEqual((self.output/'Movie #1.strm').read_text(),
+                         'https://media.example:8443/cd2/static/https/media.example:8443/false/115%2Fpt%2FMovie%20%231.mkv\n')
+        self.assertEqual((self.output/'Movie #1.nfo').read_bytes(), b'<movie/>')
+
+    def test_cd2_strm_uses_mapped_cloud_path(self):
+        self.lib.update(mode='strm', strm_target='clouddrive')
+        self.engine.cloud_paths = {'pt': '/115/pt'}
+        self.file('A.mkv'); self.engine.scan(self.lib)
+        self.assertTrue((self.output/'A.strm').read_text().endswith('/true/115%2Fpt%2FA.mkv\n'))
+
+    def test_cd2_strm_without_cloud_path_stops_before_writing(self):
+        self.lib.update(mode='strm', strm_target='clouddrive')
+        self.file('A.mkv')
+        with self.assertRaisesRegex(ValueError, 'cloud_path'):
+            self.engine.scan(self.lib)
+        self.assertFalse((self.output/'A.strm').exists())
+
+    def test_switching_strm_target_rewrites_owned_strm(self):
+        self.lib['mode'] = 'strm'; movie = self.file('A.mkv'); self.engine.scan(self.lib)
+        self.assertEqual((self.output/'A.strm').read_text(), str(movie)+'\n')
+        self.lib.update(strm_target='clouddrive', cloud_path='/115/pt')
+        self.assertEqual(self.engine.scan(self.lib)['change_count'], 1)
+        self.assertIn('/static/http/', (self.output/'A.strm').read_text())
+        self.assertEqual(self.engine.scan(self.lib)['change_count'], 0)
+        self.lib['strm_target'] = 'path'
+        self.assertEqual(self.engine.scan(self.lib)['change_count'], 1)
+        self.assertEqual((self.output/'A.strm').read_text(), str(movie)+'\n')
+
+    def test_strm_target_validation_and_old_config_defaults(self):
+        from bridge.config import fill_library_defaults, load
+        for bad in ({'strm_target': 'alist'}, {'strm_preview': 'yes'}, {'strm_base_url': 'http://u:p@host:1'},
+                    {'strm_base_url': 'http://host:1/?token=x'}):
+            config = copy.deepcopy(self.config); config['libraries'][0].update(bad)
+            with self.assertRaises(ValueError):
+                validate(config)
+        old = copy.deepcopy(self.config)
+        for key in ('strm_target', 'strm_base_url', 'strm_preview'):
+            del old['libraries'][0][key]
+        path = self.data/'old.json'; path.write_text(json.dumps(old), encoding='utf-8')
+        lib = load(path)['libraries'][0]
+        self.assertEqual((lib['strm_target'], lib['strm_base_url'], lib['strm_preview']), ('path', '', True))
+        self.assertEqual(fill_library_defaults(old)['libraries'][0]['strm_target'], 'path')
+
     def test_strm_collision_stops_entire_scan(self):
         self.lib['mode']='strm'; self.file('Movie.mkv'); self.file('Movie.mp4')
         with self.assertRaisesRegex(ValueError,'冲突'):self.engine.scan(self.lib)

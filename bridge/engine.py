@@ -6,7 +6,7 @@ import stat
 from pathlib import Path, PurePosixPath
 import threading
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import uuid
 
 from .paths import file_hash, is_link, no_link_ancestors, safe_join, walk
@@ -14,9 +14,22 @@ from .mounts import identities, assert_unchanged
 from .parallel import bounded_map
 from .cloud_scan import CloudScanner
 from .cloud_content import CloudContent
+from .cloud import virtual_path
 
 VIDEOS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts", ".m2ts", ".wmv", ".mpg", ".mpeg", ".webm", ".iso", ".rmvb"}
 METADATA = {".nfo", ".jpg", ".jpeg", ".png", ".webp", ".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".xml"}
+
+
+def cd2_strm_base(base_url, preview):
+    """The CD2 proxy download prefix, same layout as GetDownloadUrlPath's /static/{SCHEME}/{HOST}/{PREVIEW}/."""
+    u = urlsplit(base_url)
+    return (f"{u.scheme}://{u.netloc}{u.path.rstrip('/')}/static/{u.scheme}/{u.netloc}/"
+            f"{'true' if preview else 'false'}/")
+
+
+def cd2_strm_url(base, cloud_root, rel):
+    # CD2 takes the whole virtual path as one encoded segment, without the leading "/".
+    return base + quote((cloud_root.rstrip("/") + "/" + rel).lstrip("/"), safe="")
 
 
 class Engine:
@@ -27,6 +40,7 @@ class Engine:
         self.scan_progress = scan_progress
         self.cloud_paths = cloud_paths or {}
         self.metadata_reader = None
+        self.strm_cd2 = None  # (url base, CD2 virtual root) for the library being scanned
 
     def health(self, lib):
         identities(lib)
@@ -97,7 +111,9 @@ class Engine:
             self.progress(stage, progress_path)
         checkpoint()
         dest = safe_join(output, dest_rel)
-        sig = f"{st.st_size}:{st.st_mtime_ns}:{kind}:{lib['strm_prefix']}"
+        # CD2 STRM signatures name the target; plain STRM keeps its original signature.
+        target = "cd2:"+"".join(self.strm_cd2) if kind == "strm" and self.strm_cd2 else lib["strm_prefix"]
+        sig = f"{st.st_size}:{st.st_mtime_ns}:{kind}:{target}"
         exists = os.path.lexists(dest)
         if row and row["dest"] != dest_rel:
             return None, f"{rel}: 修改输出模式请使用新的媒体库 id"
@@ -114,7 +130,10 @@ class Engine:
             payload = str(p.absolute()); fingerprint = payload
         elif kind == "strm":
             prefix = lib["strm_prefix"]
-            text = prefix.rstrip("/")+"/"+quote(rel, safe="/") if prefix else str(p.absolute())
+            if self.strm_cd2:
+                text = cd2_strm_url(self.strm_cd2[0], self.strm_cd2[1], rel)
+            else:
+                text = prefix.rstrip("/")+"/"+quote(rel, safe="/") if prefix else str(p.absolute())
             payload = (text+"\n").encode("utf-8")
             fingerprint = hashlib.sha256(payload).hexdigest()
         else:
@@ -218,6 +237,14 @@ class Engine:
                     raise OSError("扫描范围不再是目录，已停止处理")
                 inventory = walk(base,errors=listing_errors,progress=reading,exclude_dirs=excluded,
                                  workers=self.config["sync"]["scan_workers"])
+        self.strm_cd2 = None
+        if lib["mode"] == "strm" and lib["strm_target"] == "clouddrive":
+            root = lib["cloud_path"] or self.cloud_paths.get(lib["id"]) or (scanner.root if scanner else "")
+            if not root:
+                raise ValueError(f"{lib['name']} ({lib['id']}): CD2 STRM 需要该库的 cloud_path（CD2 虚拟路径），"
+                                 "或开启 CD2 文件通知以自动识别挂载映射")
+            self.strm_cd2 = (cd2_strm_base(lib["strm_base_url"] or self.config["cloud"]["url"], lib["strm_preview"]),
+                             virtual_path(root))
         for item in inventory:
             files.append(item)
             if item[0].suffix.lower() in VIDEOS | METADATA:

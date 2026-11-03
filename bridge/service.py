@@ -8,7 +8,7 @@ import uuid
 
 from .cloud import CloudClient, CloudMonitor
 from .cloud_scan import CloudScanner
-from .config import atomic_json, load, validate
+from .config import atomic_json, fill_library_defaults, load, validate
 from .engine import Engine
 from .notify import deliver
 from .paths import safe_join
@@ -255,6 +255,8 @@ class Service:
         return {"ok": self.thread.is_alive() and not self.stop_event.is_set()}
 
     def validate_config_update(self, config):
+        # Pasted JSON from an older version may lack newer library fields.
+        fill_library_defaults(config)
         validate(config,self.data_dir)
         current = self.config
         for lib in config["libraries"]:

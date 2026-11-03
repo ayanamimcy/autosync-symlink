@@ -25,6 +25,7 @@ DEFAULT = {
                    "source": "/mnt/clouddrive/pt", "output": "/srv/media/library/pt",
                    "mount_root": "", "output_mount_root": "",
                    "cloud_path": "", "mode": "symlink", "strm_prefix": "",
+                   "strm_target": "path", "strm_base_url": "", "strm_preview": True,
                    "sentinel": ".media-bridge-ready"}],
     "servers": [
         {"id": "plex", "kind": "plex", "enabled": False,
@@ -173,6 +174,12 @@ def validate(c, data_dir=None):
             raise ValueError("cloud_path 必须是 CloudDrive 虚拟绝对路径")
         if lib["mode"] == "strm" and lib["strm_prefix"]:
             url(lib["strm_prefix"])
+        if lib["strm_target"] not in ("path", "clouddrive") or type(lib["strm_preview"]) is not bool:
+            raise ValueError("媒体库 strm_target 仅支持 path/clouddrive，strm_preview 必须是布尔值")
+        if not isinstance(lib["strm_base_url"], str):
+            raise ValueError("strm_base_url 必须是字符串")
+        if lib["strm_base_url"]:
+            url(lib["strm_base_url"])
         if lib["enabled"]:
             roots += [(lib["source"], "source"), (lib["output"], "output")]
     for i, (a, _) in enumerate(roots):
@@ -226,6 +233,14 @@ def load(path):
                 "scan_backend", "cloud_list_workers", "cloud_list_interval_ms",
                 "metadata_retries", "cloud_check_seconds"):
         config.get("sync", {}).setdefault(key, DEFAULT["sync"][key])
-    for lib in config.get("libraries", []):
-        lib.setdefault("mount_root", ""); lib.setdefault("output_mount_root", "")
+    fill_library_defaults(config)
     return validate(config, path.parent)
+
+
+def fill_library_defaults(config):
+    """Add library fields introduced after the first release; existing values are kept."""
+    for lib in config.get("libraries", []) if isinstance(config, dict) else []:
+        if isinstance(lib, dict):
+            for key in ("mount_root", "output_mount_root", "strm_target", "strm_base_url", "strm_preview"):
+                lib.setdefault(key, DEFAULT["libraries"][0][key])
+    return config

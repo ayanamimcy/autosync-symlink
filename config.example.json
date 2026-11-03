@@ -54,6 +54,9 @@
       "cloud_path": "",
       "mode": "symlink",
       "strm_prefix": "",
+      "strm_target": "path",
+      "strm_base_url": "",
+      "strm_preview": true,
       "sentinel": ".media-bridge-ready"
     }
   ],

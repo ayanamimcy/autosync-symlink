@@ -82,6 +82,33 @@ python3 -m venv .venv
 
 保留每 12 小时一次全量、关闭启动/重连补扫的配置仍有效。若要避免本地监听启动遍历和轮询，请同时使用 `watch_mode=off`，配合 CD2 文件通知；API 后端不会替代本地监听机制。
 
+## STRM 指向 CD2 播放地址
+
+`mode=strm` 的媒体库可以让 STRM 直接写 CD2 的代理播放地址，媒体服务器通过 HTTP 从 CD2 取流，不需要访问挂载盘。在 Web「配置管理」的媒体库卡片里把「STRM 内容」切换为「CD2 播放地址」，或在库配置中设置：
+
+```json
+{
+  "mode": "strm",
+  "cloud_path": "/115open/云下载",
+  "strm_target": "clouddrive",
+  "strm_base_url": "",
+  "strm_preview": true
+}
+```
+
+生成的内容与 CD2 自己的播放链接格式一致：`{地址}/static/{scheme}/{host}/{true|false}/{虚拟路径}`。虚拟路径为 `cloud_path` 加上文件相对路径，去掉开头的 `/` 后整段 URL 编码（`/` 编为 `%2F`）。例如：
+
+```
+http://100.78.216.82:19798/static/http/100.78.216.82:19798/true/115open%2F%E4%BA%91%E4%B8%8B%E8%BD%BD%2F...%2FMovie.mkv
+```
+
+- `strm_target`：`path`（默认，保持原行为：有 `strm_prefix` 时写“前缀 + 相对路径”，否则写本地挂载绝对路径）或 `clouddrive`。
+- `strm_base_url`：播放端访问 CD2 的地址，留空时使用 `cloud.url`。本服务和媒体服务器访问 CD2 的地址不同时（例如容器内用 `host.docker.internal`、Emby 用局域网 IP），这里填媒体服务器能访问的地址。可以带反向代理路径前缀，不能带账号密码或查询参数。
+- `strm_preview`：地址中的 preview 段，默认 `true`。
+- 虚拟路径优先使用库的 `cloud_path`；留空时使用开启 CD2 文件通知后识别出的挂载映射，或 API 扫描后端的根路径。都没有时整次扫描在写入前停止并提示填写 `cloud_path`。
+- 链接本身不带 Token，要求 CD2 的 `/static` 下载路径对媒体服务器可访问；是否需要鉴权以及能否播放，请先在目标环境用一个文件实际验证。
+- 在 `path` 与 `clouddrive` 之间切换、修改地址或 preview 后，下一次同步会重写本程序托管的 STRM；被其他程序修改过的 STRM 仍然保留不覆盖。仍需要源目录挂载用于健康标记检查和扫描（挂载盘后端）。
+
 ## 跳过启动全量扫描
 
 需要包含本功能的新镜像/代码。将以下字段合并到现有配置的 `sync` 中，保留其他字段；不要用片段替换整个配置：

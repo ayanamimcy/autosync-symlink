@@ -37,6 +37,9 @@ function renderConfig(){
  $('#library-config').replaceChildren();$('#server-config').replaceChildren();
  for(const lib of cfg.libraries){const p=el('article','panel'),grid=el('div','form-grid');p.append(el('h3','',lib.name+' / '+lib.id));
   for(const [key,label,type] of [['source','视频源目录','text'],['output','软链接输出目录','text'],['cloud_path','CloudDrive 虚拟路径（可留空自动识别）','text'],['enabled','启用此媒体库','checkbox']]){const f=field(label,lib[key],type);f.input.addEventListener('input',()=>{lib[key]=type==='checkbox'?f.input.checked:f.input.value;});grid.append(f.label);}
+  if(lib.mode==='strm'){const l=el('label','','STRM 内容'),sel=el('select');for(const [v,t] of [['path','本地路径 / 自定义前缀（strm_prefix）'],['clouddrive','CD2 播放地址（/static/…）']]){const o=el('option','',t);o.value=v;sel.append(o);}sel.value=lib.strm_target;sel.addEventListener('input',()=>{lib.strm_target=sel.value;});l.append(sel);grid.append(l);
+   const u=field('CD2 播放地址前缀（留空使用 CloudDrive2 服务地址）',lib.strm_base_url);u.input.placeholder='http://192.168.1.10:19798';u.input.addEventListener('input',()=>{lib.strm_base_url=u.input.value.trim();});grid.append(u.label);
+   const pv=field('CD2 地址使用 preview=true',lib.strm_preview,'checkbox');pv.input.addEventListener('input',()=>{lib.strm_preview=pv.input.checked;});grid.append(pv.label);}
   p.append(grid,el('p','fine','保留现有目录和命名。Linux Plex/Jellyfin 可使用 symlink；Windows Plex 文件软链接存在兼容性限制。'));$('#library-config').append(p);
  }
  for(const server of cfg.servers){const p=el('article','panel'),grid=el('div','form-grid');p.append(el('h3','',server.kind.toUpperCase()+' / '+server.id));
