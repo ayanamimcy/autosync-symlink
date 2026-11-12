@@ -402,9 +402,11 @@ class ServiceTests(Fixture):
         try:
             s.cloud_paths={'pt':'/115/pt'}
             s.change({'path':'/115/pt/A/old','new_path':'/115/pt/B/new','type':2,'directory':True})
-            self.assertEqual(set(s.pending),{('pt','A'),('pt','B')})
+            self.assertEqual(set(s.pending),{('pt','A/old'),('pt','B/new')})
+            s.change({'path':'/115/pt/A/e.mkv','new_path':'','type':0,'directory':False})
+            self.assertIn(('pt','A'),s.pending)
             s.change({'path':'/115/pt2/other','new_path':'','type':0,'directory':False})
-            self.assertEqual(len(s.pending),2)
+            self.assertEqual(len(s.pending),3)
         finally:s.state.db.close()
     def test_debounce_and_root_collapse(self):
         s=self.make()

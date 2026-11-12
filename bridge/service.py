@@ -146,7 +146,11 @@ class Service:
                     continue
                 if p == cp or p.startswith(cp+"/"):
                     rel = p[len(cp):].lstrip("/")
-                    scope = str(PurePosixPath(rel).parent)
+                    # A directory event scans that directory itself: for a top-level folder
+                    # its parent would be the library root, i.e. a whole-library scan.
+                    # A vanished scope (deleted / renamed away) scans as empty and its
+                    # entries go through the normal missing/cleanup handling.
+                    scope = rel if event.get("directory") and rel else str(PurePosixPath(rel).parent)
                     self.schedule(lib["id"],"" if scope=="." else scope, "CD2 文件通知")
                     matched = True
         if matched:
@@ -377,7 +381,8 @@ class Service:
     def cloud_check(self, reason):
         """Compare each library's CD2 root listing with the stored snapshot and scan what changed.
 
-        Only direct children are compared: a new or changed top-level folder is scanned.
+        Only direct children are compared: a new or changed top-level folder is scanned;
+        with cleanup on, a vanished folder is scanned by name, a vanished file scans the library.
         Changes deeper down that do not touch the top-level folder's time are left to
         push events and the periodic full scan.
         """
@@ -407,10 +412,12 @@ class Service:
                 changed = {name: value for name, value in current.items() if value[0] > since * 1e9}
             else:
                 changed = {name: value for name, value in current.items() if previous.get(name) != value}
+            if self.config["sync"]["cleanup_enabled"] and previous:
+                # A vanished folder is scanned by name (it scans as empty); only a
+                # vanished top-level file needs the whole library.
+                changed.update({name: value for name, value in previous.items() if name not in current})
             scopes = {name if value[2] else "" for name, value in changed.items()
                       if name.casefold() not in excluded}
-            if self.config["sync"]["cleanup_enabled"] and set(previous) - set(current):
-                scopes.add("")
             for scope in sorted(scopes):
                 self.schedule(lib["id"], scope, reason)
             scheduled += len(scopes)

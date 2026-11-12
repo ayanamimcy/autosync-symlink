@@ -111,6 +111,44 @@ class AutoTaskTests(Fixture):
             self.assertFalse(service.pending)  # removals need cleanup, which is off
         self.assertTrue(client.list_files.call_args.kwargs['force_refresh'])
 
+    def test_top_level_directory_event_scans_only_that_folder(self):
+        service = self.service()
+        service.discover()
+        service.change({'path': '/115/pt/New Show', 'new_path': '', 'type': 0, 'directory': True})
+        service.change({'path': '/115/pt/Old', 'new_path': '/115/pt/Renamed', 'type': 2, 'directory': True})
+        self.assertEqual(set(service.pending), {('pt', 'New Show'), ('pt', 'Old'), ('pt', 'Renamed')})
+        service.change({'path': '/115/pt/loose.mkv', 'new_path': '', 'type': 0, 'directory': False})
+        self.assertEqual(set(service.pending), {('pt', '')})
+
+    def test_directory_check_with_cleanup_scans_vanished_folders_by_name(self):
+        service = self.service(cleanup_enabled=True)
+        client = Mock()
+        client.token.return_value = 't'
+        client.list_files.side_effect = [
+            [entry('A', 1), entry('B', 1), entry('f.nfo', 1, False)],
+            [entry('A', 1), entry('f.nfo', 1, False)],
+            [entry('A', 1)]]
+        with patch('bridge.service.CloudClient', return_value=client):
+            service.cloud_check('启动后目录检查')  # no snapshot and no full scan yet: baseline
+            self.assertFalse(service.pending)
+            service.cloud_check('定期目录检查')
+            self.assertEqual(set(service.pending), {('pt', 'B')})
+            service.pending.clear()
+            service.cloud_check('定期目录检查')
+            self.assertEqual(set(service.pending), {('pt', '')})  # a top-level file vanished
+        self.assertIsNone(service.check_status['error'])
+
+    def test_first_check_with_cleanup_and_no_snapshot_does_not_fail(self):
+        service = self.service(cleanup_enabled=True)
+        scan = service.state.begin_scan('pt', '')
+        service.state.finish_scan(scan, {'seen': 1, 'change_count': 0, 'deferred': 0})
+        client = Mock()
+        client.token.return_value = 't'
+        client.list_files.return_value = [entry('A', 1)]
+        with patch('bridge.service.CloudClient', return_value=client):
+            service.cloud_check('启动后目录检查')
+        self.assertFalse(service.pending)
+
     def test_first_check_scans_folders_changed_since_last_full_scan(self):
         service = self.service()
         scan = service.state.begin_scan('pt', '')
