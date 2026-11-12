@@ -72,6 +72,26 @@ class AutoTaskTests(Fixture):
         self.assertEqual((push['received'], push['matched'], push['ignored']), (2, 1, 1))
         self.assertEqual(push['ignored_samples'], ['/elsewhere/b.mkv'])
 
+    def test_push_events_match_full_paths_when_the_token_is_scoped(self):
+        # Token rooted at /115open/pt: listings use "/tv", push events carry full paths.
+        service = self.service()
+        service.config['libraries'][0].update(cloud_path='/tv', source='/mnt/cloud/115/pt/tv')
+        mounts = [{'mount': '/mnt/cloud/115', 'source': '/115open', 'mounted': True}]
+        with patch('bridge.service.CloudClient') as client:
+            client.return_value.mount_points.return_value = mounts
+            service.discover()
+            self.assertEqual((service.cloud_paths['pt'], service.push_paths['pt']), ('/tv', '/115open/pt/tv'))
+            service.change({'path': '/115open/pt/tv/Show/Season 1/e01.mkv', 'new_path': '', 'type': 0})
+            service.change({'path': '/tv/Show/e02.mkv', 'new_path': '', 'type': 0})
+            self.assertEqual(set(service.pending), {('pt', 'Show/Season 1')})
+            self.assertEqual(service.status()['push']['matched'], 1)
+            self.assertEqual(service.status()['libraries'][0]['push_path'], '/115open/pt/tv')
+            # A failed mount read keeps the last known mapping instead of dropping events.
+            client.return_value.mount_points.side_effect = ConnectionError('down')
+            service.discover(); service.discover()
+            self.assertEqual(service.push_paths['pt'], '/115open/pt/tv')
+        self.assertEqual(sum('挂载映射未读取' in e['message'] for e in service.state.query('SELECT message FROM events')), 1)
+
     def test_directory_check_scans_new_and_changed_top_folders_only(self):
         service = self.service()
         listings = [[entry('A', 1), entry('B', 1), entry('.media-bridge-ready', 1, False)],

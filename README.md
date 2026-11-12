@@ -71,7 +71,7 @@ python3 -m venv .venv
 
 - `scan_backend` 支持 `filesystem`（挂载盘遍历，默认）和 `clouddrive`（CD2 API）。旧配置自动补齐为 `filesystem`，升级不会自行改变扫描来源。两种后端共用原清单，无需重新初始化或重建媒体库。
 - 配置 `cloud.url` 和有效 Token（或登录信息），Token 需要「列出文件」和「读取文件」权限。`cloud.enabled` 只控制文件通知订阅，API 扫描不依赖这个开关。若需实时更新，仍须启用通知。
-- 为每个库填写 CD2 中的虚拟 `cloud_path`，例如 `/115open/pt/movie`；`source` 仍填写容器内挂载路径，例如 `/srv/media/cloud/115/pt/movie`。留空时尝试通过挂载点 API 映射，需要额外的「获取挂载点」权限；映射失败会报错，不会回退扫盘。
+- 为每个库填写 CD2 中的虚拟 `cloud_path`，例如 `/115open/pt/movie`；`source` 仍填写容器内挂载路径，例如 `/srv/media/cloud/115/pt/movie`。留空时尝试通过挂载点 API 映射，需要额外的「获取挂载点」权限；映射失败会报错，不会回退扫盘。Token 只授权了子目录（例如根目录设成 `/115open/pt`）时，列目录看到的是 `/movie`，`cloud_path` 就填 `/movie`；文件推送里却总是完整路径（`/115open/pt/movie/...`），所以服务每 5 分钟用挂载点 API 算一次完整路径（状态里的 `push_path`），专门用来匹配推送。没有「获取挂载点」权限时推送按 `cloud_path` 匹配，Token 有子目录限制时就匹配不上（状态里推送全是 ignored）。
 - `GetSubFiles` 按目录流式返回路径、类型、大小、修改时间，省去挂载层逐文件属性查询。全量仍需递归列举目录；视频只创建链接/STRM，不读取内容。API 模式下，元数据通过 CD2 HTTP 下载并用 API 校验属性，不打开源挂载盘上的字幕/NFO/图片，也不对它们调用 stat。源健康标记和挂载身份检查仍保留，源/输出挂载路径要求不变。
 - `cloud_list_workers` 范围 1–4，默认 2；`cloud_list_interval_ms` 为同一扫描内目录请求的共享最小启动间隔，范围 100–60000 毫秒，默认 500。文件处理并发仍由 `file_workers` 控制；API 元数据下载并发不超过 `file_workers` 与 `cloud_list_workers` 的较小值，元数据任务的最小启动间隔同样使用 `cloud_list_interval_ms`（单个任务包含下载地址查询、一次 HTTP 下载及属性复查）。`scan_workers` 仅影响挂载盘后端。不要为了提速盲目提高并发或缩短间隔。
 - 普通全量和事件局部扫描均不强制刷新目录（`forceRefresh=false`），也不改变 CD2 的目录缓存策略。缓存过期/缺失仍可能访问上游，API 不保证比热缓存的挂载盘更快，也不保证减少 115 请求数。目录枚举 API 超时、限流、无权限、缺少成功 trailer 或非法路径会终止本次扫描；不会重试该请求或自动回退扫盘。HTTP 429 / gRPC 状态 8 会让同一 CD2 地址在本进程内进入 60 秒冷却，期间新扫描也不发送 API 请求；冷却结束不主动重扫，后续通知、定时或手动任务仍可能再次扫描。

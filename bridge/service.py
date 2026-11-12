@@ -1,13 +1,12 @@
 import collections
 import copy
-import ntpath
 from pathlib import Path, PurePosixPath
 import threading
 import time
 import uuid
 
 from .cloud import CloudClient, CloudMonitor
-from .cloud_scan import CloudScanner
+from .cloud_scan import CloudScanner, mapped_cloud_path
 from .config import atomic_json, load, validate
 from .engine import Engine
 from .notify import deliver
@@ -32,7 +31,11 @@ class Service:
         self.jobs = {}
         self.queue = []
         self.stop_event = threading.Event()
+        # cloud_paths: what the API token lists (a token can be scoped to a sub-folder).
+        # push_paths: full CD2 paths from the mount table, which push events always carry.
         self.cloud_paths = {}
+        self.push_paths = {}
+        self.discover_error = None
         self.last_results = {}
         self.busy = False
         self.activity = None
@@ -105,27 +108,28 @@ class Service:
     def discover(self):
         libs = [x for x in self.config["libraries"] if x["enabled"]]
         self.cloud_paths = {x["id"]:x["cloud_path"].rstrip("/") for x in libs if x["cloud_path"]}
-        if not self.config["cloud"]["enabled"] or len(self.cloud_paths) == len(libs):
+        if not self.config["cloud"]["enabled"]:
+            self.push_paths = {}
             return
+        # Always read the mount table, even when every cloud_path is set: a token scoped
+        # to /115open/pt lists "/tv", but push events report "/115open/pt/tv/...".
         try:
             mounts = CloudClient(self.config["cloud"]).mount_points()
-            for lib in libs:
-                if lib["id"] in self.cloud_paths:
-                    continue
-                for m in sorted(mounts,key=lambda x:len(x["mount"]),reverse=True):
-                    if not m["mounted"] or not m["mount"]:
-                        continue
-                    try:
-                        pathmod = ntpath if "\\" in m["mount"] or ":" in m["mount"] else __import__("posixpath")
-                        rel = pathmod.relpath(lib["source"],m["mount"])
-                    except ValueError:
-                        continue
-                    if rel == ".." or rel.startswith(("..\\", "../")):
-                        continue
-                    self.cloud_paths[lib["id"]] = (m["source"].rstrip("/")+"/"+("" if rel=="." else rel.replace("\\","/"))).rstrip("/")
-                    break
         except Exception as e:
-            self.state.log("WARN",f"挂载映射未读取 ({type(e).__name__})；可手填 cloud_path；未知映射的事件将触发该库补扫")
+            if self.discover_error != type(e).__name__:
+                self.state.log("WARN",f"挂载映射未读取 ({type(e).__name__})；推送事件按 cloud_path 匹配，"
+                                      "未知映射的事件将触发该库补扫")
+            self.discover_error = type(e).__name__
+            return  # keep the last known push paths
+        self.discover_error = None
+        push = {}
+        for lib in libs:
+            try:
+                push[lib["id"]] = mapped_cloud_path(lib, mounts).rstrip("/")
+            except ValueError:
+                continue
+            self.cloud_paths.setdefault(lib["id"], push[lib["id"]])
+        self.push_paths = push
 
     def change(self, event):
         self.push["received"] += 1
@@ -134,7 +138,7 @@ class Service:
         for lib in self.config["libraries"]:
             if not lib["enabled"]:
                 continue
-            cp = self.cloud_paths.get(lib["id"])
+            cp = self.push_paths.get(lib["id"], self.cloud_paths.get(lib["id"]))
             if cp is None:
                 self.schedule(lib["id"], "", "CD2 文件通知（库映射未知）"); matched = True; continue
             for p in (event["path"],event["new_path"]):
@@ -272,7 +276,7 @@ class Service:
             old_monitor.stop()
             self.native.stop()
             self.config = copy.deepcopy(config)
-            self.cloud_paths = {}
+            self.cloud_paths, self.push_paths = {}, {}
             with self.queue_lock:
                 self.pending.clear()
             self.monitor = self.new_monitor()
@@ -438,6 +442,7 @@ class Service:
                 "pending_notifications":self.state.query("SELECT COUNT(*) AS n FROM notices")[0]["n"],
                 "libraries":[{"id":x["id"],"name":x["name"],"enabled":x["enabled"],"source":x["source"],
                               "output":x["output"],"mode":x["mode"],"cloud_path":self.cloud_paths.get(x["id"]),
+                              "push_path":self.push_paths.get(x["id"]),
                               "last":self.last_results.get(x["id"]),"scan":self.state.scan_status(x["id"]),
                               "progress":live_progress.get(x["id"])} for x in self.config["libraries"]],
                 "jobs":jobs, "waiting":waiting,
